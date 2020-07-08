@@ -11,6 +11,7 @@ from irrd.utils.rpsl_samples import (object_sample_mapping, SAMPLE_MALFORMED_EMP
                                      SAMPLE_MALFORMED_SOURCE,
                                      SAMPLE_MALFORMED_PK, SAMPLE_UNKNOWN_ATTRIBUTE,
                                      SAMPLE_INVALID_MULTIPLE_ATTRIBUTE,
+                                     SAMPLE_NON_UTF_8_TEXT,
                                      KEY_CERT_SIGNED_MESSAGE_VALID, KEY_CERT_SIGNED_MESSAGE_INVALID,
                                      KEY_CERT_SIGNED_MESSAGE_CORRUPT,
                                      KEY_CERT_SIGNED_MESSAGE_WRONG_KEY,
@@ -103,6 +104,11 @@ class TestRPSLParsingGeneric:
         obj = rpsl_object_from_text(SAMPLE_ROUTE + ' \n' + SAMPLE_ROUTE)
         assert len(obj.messages.errors()) == 3, f'Unexpected extra errors: {obj.messages.errors()}'
         assert 'Attribute "route" on object route occurs multiple times' in obj.messages.errors()[0]
+
+    def test_invalid_non_utf8(self):
+        obj = rpsl_object_from_text(SAMPLE_NON_UTF_8_TEXT)
+        assert len(obj.messages.errors()) == 3, f'Unexpected extra errors: {obj.messages.errors()}'
+        assert 'Attribute "desc" on object route contains non-ascii characters' in obj.messages.errors()[0]
 
 
 class TestRPSLAsBlock:

@@ -786,6 +786,14 @@ zwBzW+p+qqN0rNRMFTNy3WnVVzZY5UWljU83jMBQkXiOSxo72/yIpG89xzi24Bqp
 -----END PGP SIGNATURE-----
 """
 
+# Issue: 358 - https://github.com/irrdnet/irrd/issues/358
+SAMPLE_NON_UTF_8_TEXT = """route:          187.73.32.0/22
+descr:          Digirati Inform\xe1tica, Servi\xe7os e Telecomunica\xe7\xf5es
+origin:         AS262672
+mnt-by:         MAINT-AS262672
+changed:        andre@digirati.com.br 20150601  #11:24:16Z
+source:         RADB"""
+
 object_sample_mapping = {
     'as-block': SAMPLE_AS_BLOCK,
     'as-set': SAMPLE_AS_SET,
