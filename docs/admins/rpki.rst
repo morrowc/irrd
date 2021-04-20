@@ -2,19 +2,20 @@
 RPKI integration
 ================
 
-IRRd can operate in RPKI-aware mode, where it imports ROA objects which
-are used to validate `route(6)` objects. IRRd also generates pseudo-IRR
+IRRd can operate in RPKI-aware mode, where it imports ROA objects and
+uses those to validate `route(6)` objects. IRRd also generates pseudo-IRR
 objects that represent ROA data.
 
-.. contents:: :backlinks: none
+.. contents::
+   :backlinks: none
 
 Enabling RPKI-aware mode
 ------------------------
-You can enable RPKI-aware mode by setting the ``rpki.roa_source`` setting
+You can enable RPKI-aware mode by setting ``rpki.roa_source``
 to a URL of a ROA export in JSON format. RPKI-aware mode is **enabled**
 by default. To disable RPKI-aware mode, set this to ``null``.
 
-As soon as this is enabled and IRRd is (re)started or a SIGHUP is sent,
+As soon as this is enabled and you (re)start IRRd or send a SIGHUP,
 IRRd will import the ROAs and mark any invalid existing `route(6)` as
 such in the database.
 
@@ -32,7 +33,7 @@ Query responses
 ---------------
 By default, `route(6)` objects that conflict with a ROA are not included
 in any query response. This is determined using
-`RFC6811 origin validation <https://tools.ietf.org/html/rfc6811>` and
+`RFC6811 origin validation <https://tools.ietf.org/html/rfc6811>`_ and
 applies to all query types.
 
 Query responses for the text of `route(6)` objects include a
@@ -87,22 +88,25 @@ as RPKI invalid.
 Notifications
 -------------
 If a route(6) object in an authoritative source is newly marked RPKI invalid,
-a notification is sent to all contacts. Contacts are determined as any email
+a notification may be sent to all contacts. Contacts are determined as any email
 address, of any tech-c and admin-c, on any mnt-by on the route object,
 combined with any mnt-nfy of any of those maintainers.
 Emails are aggregated, so a single address will receive a single email with
 all objects listed for which it is a contact.
+
+This behaviour is enabled or disabled with the ``rpki.notify_invalid_enabled``
+setting. If you have any authoritative sources configured, you must explicitly
+set this to ``true`` or ``false`` in your configuration.
 
 "Newly" invalid means that an object was previously valid or not_found, but
 a ROA update has changed the status to invalid. At the time this happens,
 the email is sent. If the status returns to valid or not_found, no email
 is sent. If it then returns to invalid, a new email is sent.
 
-This behaviour is enabled or disabled with the ``rpki.notify_invalid_enabled``
-setting. You must set this to ``true`` or ``false`` in your configuration.
-
 When first enabling RPKI-aware mode, a large number of objects may be marked
 as newly invalid, which can cause a large amount of notifications.
+
+Notifications are never sent for objects from non-authoritative sources.
 
 .. danger::
     Care is required with the ``rpki.notify_invalid_enabled`` setting in testing
@@ -158,13 +162,6 @@ rejected for being invalid. This will be resolved at the next ROA import,
 allowing the user to create the `route`.
 When a user attempts to create any `route` that is RPKI invalid, the error
 messages includes a note of the configured ROA import time.
-
-.. note::
-    In IRRd logs, you may see things like ``RPKI status NOT_FOUND`` for objects
-    for which RPKI validation does not apply, like `person` objects. This is
-    intentional and not a bug, as IRRd uses this status for any object for
-    which there is no RPKI information.
-
 
 .. _rpki-slurm:
 

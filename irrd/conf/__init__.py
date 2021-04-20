@@ -1,16 +1,17 @@
 import importlib.util
-import sys
-import time
-
 import logging.config
 import os
 import re
 import signal
-import yaml
-from IPy import IP
-from dotted.collection import DottedDict
+import sys
+import time
 from pathlib import Path
 from typing import Any, List, Optional
+
+import yaml
+from IPy import IP
+
+from irrd.vendor.dotted.collection import DottedDict
 
 CONFIG_PATH_DEFAULT = '/etc/irrd.yaml'
 
@@ -19,6 +20,83 @@ PASSWORD_HASH_DUMMY_VALUE = 'DummyValue'
 SOURCE_NAME_RE = re.compile('^[A-Z][A-Z0-9-]*[A-Z0-9]$')
 RPKI_IRR_PSEUDO_SOURCE = 'RPKI'
 
+# Note that sources are checked separately,
+# and 'access_lists' is always permitted
+KNOWN_CONFIG_KEYS = DottedDict({
+    'database_url': {},
+    'redis_url': {},
+    'piddir': {},
+    'user': {},
+    'group': {},
+    'server': {
+        'http': {
+            'interface': {},
+            'port': {},
+            'status_access_list': {},
+            'workers': {},
+            'forwarded_allowed_ips': {},
+        },
+        'whois': {
+            'interface': {},
+            'port': {},
+            'access_list': {},
+            'max_connections': {},
+        },
+    },
+    'email': {
+        'from': {},
+        'footer': {},
+        'smtp': {},
+        'recipient_override': {},
+        'notification_header': {},
+    },
+    'auth': {
+        'override_password': {},
+        'authenticate_related_mntners': {},
+        'gnupg_keyring': {},
+    },
+    'rpki': {
+        'roa_source': {},
+        'roa_import_timer': {},
+        'slurm_source': {},
+        'pseudo_irr_remarks': {},
+        'notify_invalid_enabled': {},
+        'notify_invalid_subject': {},
+        'notify_invalid_header': {},
+    },
+    'scopefilter': {
+        'prefixes': {},
+        'asns': {},
+    },
+    'log': {
+        'logfile_path': {},
+        'level': {},
+        'logging_config_path': {},
+    },
+    'sources_default': {},
+    'compatibility': {
+        'inetnum_search_disabled': {},
+        'irrd42_migration_in_progress': {},
+        'ipv4_only_route_set_members': {},
+    }
+})
+
+KNOWN_SOURCES_KEYS = {
+    'authoritative',
+    'keep_journal',
+    'nrtm_host',
+    'nrtm_port',
+    'import_source',
+    'import_serial_source',
+    'import_timer',
+    'object_class_filter',
+    'export_destination',
+    'export_timer',
+    'nrtm_access_list',
+    'strict_import_keycert_objects',
+    'rpki_excluded',
+    'scopefilter_excluded',
+}
 
 LOGGING = {
     'version': 1,
@@ -108,6 +186,7 @@ class Configuration:
                 }
                 # noinspection PyTypeChecker
                 LOGGING['loggers']['']['handlers'] = ['file']   # type:ignore
+                self.logging_config = LOGGING
                 logging.config.dictConfig(LOGGING)
 
             # Re-commit to apply loglevel
@@ -126,6 +205,14 @@ class Configuration:
         If it is not found in any, the value of the default paramater
         is returned, which is None by default.
         """
+        if setting_name.startswith('sources'):
+            components = setting_name.split('.')
+            if len(components) == 3 and components[2] not in KNOWN_SOURCES_KEYS:
+                raise ValueError(f'Unknown setting {setting_name}')
+        elif not setting_name.startswith('access_lists'):
+            if KNOWN_CONFIG_KEYS.get(setting_name) is None:
+                raise ValueError(f'Unknown setting {setting_name}')
+
         env_key = 'IRRD_' + setting_name.upper().replace('.', '_')
         if env_key in os.environ:
             return os.environ[env_key]
@@ -198,6 +285,19 @@ class Configuration:
         errors = []
         config = self.user_config_staging
 
+        for key, value in config.items():
+            if key in ['sources', 'access_lists']:
+                continue
+            known = KNOWN_CONFIG_KEYS.get(key)
+            if known is None:
+                errors.append(f'Unknown setting key: {key}')
+            if hasattr(value, 'items'):
+                for key2, value2 in value.items():
+                    subkey = key + '.' + key2
+                    known_sub = KNOWN_CONFIG_KEYS.get(subkey)
+                    if known_sub is None:
+                        errors.append(f'Unknown setting key: {subkey}')
+
         if not self._check_is_str(config, 'database_url'):
             errors.append('Setting database_url is required.')
 
@@ -209,10 +309,10 @@ class Configuration:
 
         expected_access_lists = {
             config.get('server.whois.access_list'),
-            config.get('server.http.access_list'),
+            config.get('server.http.status_access_list'),
         }
 
-        if not self._check_is_str(config, 'email.from') or '@' not in config.get('email.from'):
+        if not self._check_is_str(config, 'email.from') or '@' not in config.get('email.from', ''):
             errors.append('Setting email.from is required and must be an email address.')
         if not self._check_is_str(config, 'email.smtp'):
             errors.append('Setting email.smtp is required.')
@@ -220,12 +320,15 @@ class Configuration:
                 or '@' not in config.get('email.recipient_override', '@'):
             errors.append('Setting email.recipient_override must be an email address if set.')
 
-        string_not_required = ['email.footer', 'server.whois.access_list', 'server.http.access_list',
-                               'rpki.notify_invalid_subject', 'rpki.notify_invalid_header',
-                               'rpki.slurm_source']
+        string_not_required = ['email.footer', 'server.whois.access_list',
+                               'server.http.status_access_list', 'rpki.notify_invalid_subject',
+                               'rpki.notify_invalid_header', 'rpki.slurm_source', 'user', 'group']
         for setting in string_not_required:
             if not self._check_is_str(config, setting, required=False):
                 errors.append(f'Setting {setting} must be a string, if defined.')
+
+        if bool(config.get('user')) != bool(config.get('group')):
+            errors.append('Settings user and group must both be defined, or neither.')
 
         if not self._check_is_str(config, 'auth.gnupg_keyring'):
             errors.append('Setting auth.gnupg_keyring is required.')
@@ -242,24 +345,32 @@ class Configuration:
                 except ValueError as ve:
                     errors.append(f'Invalid item in access list {name}: {ve}.')
 
+        for prefix in config.get('scopefilter.prefixes', []):
+            try:
+                IP(prefix)
+            except ValueError as ve:
+                errors.append(f'Invalid item in prefix scopefilter: {prefix}: {ve}.')
+
+        for asn in config.get('scopefilter.asns', []):
+            try:
+                if '-' in str(asn):
+                    first, last = asn.split('-')
+                    int(first)
+                    int(last)
+                else:
+                    int(asn)
+            except ValueError:
+                errors.append(f'Invalid item in asn scopefilter: {asn}.')
+
         known_sources = set(config.get('sources', {}).keys())
-        if config.get('rpki.roa_source', 'https://rpki.gin.ntt.net/api/export.json'):
-            known_sources.add(RPKI_IRR_PSEUDO_SOURCE)
-            if config.get('rpki.notify_invalid_enabled') is None:
-                errors.append('RPKI-aware mode is enabled, but rpki.notify_invalid_enabled '
-                              'is not set. Set to true or false. DANGER: care is required with '
-                              'this setting in testing setups with live data, as it may send bulk '
-                              'emails to real resource contacts unless email.recipient_override '
-                              'is also set. Read documentation carefully.')
 
-        unknown_default_sources = set(config.get('sources_default', [])).difference(known_sources)
-        if unknown_default_sources:
-            errors.append(f'Setting sources_default contains unknown sources: {", ".join(unknown_default_sources)}')
-
-        if not str(config.get('rpki.roa_import_timer', '0')).isnumeric():
-            errors.append('Setting rpki.roa_import_timer must be set to a number.')
-
+        has_authoritative_sources = False
         for name, details in config.get('sources', {}).items():
+            unknown_keys = set(details.keys()) - KNOWN_SOURCES_KEYS
+            if unknown_keys:
+                errors.append(f'Unknown key(s) under source {name}: {", ".join(unknown_keys)}')
+            if details.get('authoritative'):
+                has_authoritative_sources = True
             if config.get('rpki.roa_source') and name == RPKI_IRR_PSEUDO_SOURCE:
                 errors.append(f'Setting sources contains reserved source name: {RPKI_IRR_PSEUDO_SOURCE}')
             if not SOURCE_NAME_RE.match(name):
@@ -283,6 +394,23 @@ class Configuration:
                 errors.append(f'Setting import_timer for source {name} must be a number.')
             if not str(details.get('export_timer', '0')).isnumeric():
                 errors.append(f'Setting export_timer for source {name} must be a number.')
+
+        if config.get('rpki.roa_source', 'https://rpki.gin.ntt.net/api/export.json'):
+            known_sources.add(RPKI_IRR_PSEUDO_SOURCE)
+            if has_authoritative_sources and config.get('rpki.notify_invalid_enabled') is None:
+                errors.append('RPKI-aware mode is enabled and authoritative sources are configured, '
+                              'but rpki.notify_invalid_enabled is not set. Set to true or false.'
+                              'DANGER: care is required with this setting in testing setups with '
+                              'live data, as it may send bulk emails to real resource contacts '
+                              'unless email.recipient_override is also set. '
+                              'Read documentation carefully.')
+
+        unknown_default_sources = set(config.get('sources_default', [])).difference(known_sources)
+        if unknown_default_sources:
+            errors.append(f'Setting sources_default contains unknown sources: {", ".join(unknown_default_sources)}')
+
+        if not str(config.get('rpki.roa_import_timer', '0')).isnumeric():
+            errors.append('Setting rpki.roa_import_timer must be set to a number.')
 
         if config.get('log.level') and not config.get('log.level') in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
             errors.append(f'Invalid log.level: {config.get("log.level")}. '

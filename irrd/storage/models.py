@@ -6,19 +6,12 @@ from sqlalchemy.ext.declarative import declarative_base, declared_attr
 
 from irrd.rpki.status import RPKIStatus
 from irrd.rpsl.rpsl_objects import lookup_field_names
+from irrd.scopefilter.status import ScopeFilterStatus
 
 
 class DatabaseOperation(enum.Enum):
     add_or_update = 'ADD'
     delete = 'DEL'
-
-
-# To be moved at a later time
-class BogonStatus(enum.Enum):
-    unknown = 'UNKNOWN'
-    not_bogon = 'NOT_BOGON'
-    bogon_as = 'BOGON_AS'
-    bogon_prefix = 'BOGON_PREFIX'
 
 
 class JournalEntryOrigin(enum.Enum):
@@ -34,8 +27,8 @@ class JournalEntryOrigin(enum.Enum):
     auth_change = 'AUTH_CHANGE'
     # Journal entry caused by a change in in the RPKI status of an object in an authoritative db
     rpki_status = 'RPKI_STATUS'
-    # Journal entry caused by a change in in the bogon status of an object in an authoritative db
-    bogon_status = 'BOGON_STATUS'
+    # Journal entry caused by a change in the scope filter status
+    scope_filter = 'SCOPE_FILTER'
 
 
 Base = declarative_base()
@@ -66,12 +59,13 @@ class RPSLDatabaseObject(Base):  # type: ignore
     ip_size = sa.Column(sa.DECIMAL(scale=0))
     # Only filled for route/route6
     prefix_length = sa.Column(sa.Integer, nullable=True)
+    prefix = sa.Column(pg.CIDR, nullable=True)
 
     asn_first = sa.Column(sa.BigInteger, index=True)
     asn_last = sa.Column(sa.BigInteger, index=True)
 
     rpki_status = sa.Column(sa.Enum(RPKIStatus), nullable=False, index=True, server_default=RPKIStatus.not_found.name)
-    bogon_status = sa.Column(sa.Enum(BogonStatus), nullable=False, index=True, server_default=BogonStatus.unknown.name)
+    scopefilter_status = sa.Column(sa.Enum(ScopeFilterStatus), nullable=False, index=True, server_default=ScopeFilterStatus.in_scope.name)
 
     created = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     updated = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
@@ -83,6 +77,8 @@ class RPSLDatabaseObject(Base):  # type: ignore
             sa.Index('ix_rpsl_objects_ip_first_ip_last', 'ip_first', 'ip_last', ),
             sa.Index('ix_rpsl_objects_ip_last_ip_first', 'ip_last', 'ip_first'),
             sa.Index('ix_rpsl_objects_asn_first_asn_last', 'asn_first', 'asn_last'),
+            sa.Index('ix_rpsl_objects_prefix_gist', sa.text('prefix inet_ops'),
+                     postgresql_using='gist')
         ]
         for name in lookup_field_names():
             index_name = 'ix_rpsl_objects_parsed_data_' + name.replace('-', '_')
@@ -138,7 +134,7 @@ class RPSLDatabaseStatus(Base):  # type: ignore
     pk = sa.Column(pg.UUID(as_uuid=True), server_default=sa.text('gen_random_uuid()'), primary_key=True)
     source = sa.Column(sa.String, index=True, nullable=False, unique=True)
 
-    # The oldest and newest serials seen, for any reason at any time
+    # The oldest and newest serials seen, for any reason since the last import
     serial_oldest_seen = sa.Column(sa.Integer)
     serial_newest_seen = sa.Column(sa.Integer)
     # The oldest and newest serials in the current local journal
@@ -150,6 +146,7 @@ class RPSLDatabaseStatus(Base):  # type: ignore
     serial_newest_mirror = sa.Column(sa.Integer)
 
     force_reload = sa.Column(sa.Boolean(), default=False, nullable=False)
+    synchronised_serials = sa.Column(sa.Boolean(), default=True, nullable=False)
 
     last_error = sa.Column(sa.Text)
     last_error_timestamp = sa.Column(sa.DateTime(timezone=True))

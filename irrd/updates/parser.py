@@ -1,18 +1,20 @@
 import difflib
 import logging
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict, Union
 
 from irrd.conf import get_setting
-from irrd.rpki.validators import SingleRouteROAValidator
 from irrd.rpki.status import RPKIStatus
-from irrd.storage.database_handler import DatabaseHandler
-from irrd.storage.queries import RPSLDatabaseQuery
+from irrd.rpki.validators import SingleRouteROAValidator
 from irrd.rpsl.parser import UnknownRPSLObjectClassException, RPSLObject
 from irrd.rpsl.rpsl_objects import rpsl_object_from_text, RPSLMntner
+from irrd.scopefilter.status import ScopeFilterStatus
+from irrd.scopefilter.validators import ScopeFilterValidator
+from irrd.storage.database_handler import DatabaseHandler
+from irrd.storage.models import JournalEntryOrigin
+from irrd.storage.queries import RPSLDatabaseQuery
 from irrd.utils.text import splitline_unicodesafe
 from .parser_state import UpdateRequestType, UpdateRequestStatus
 from .validators import ReferenceValidator, AuthValidator
-from ..storage.models import JournalEntryOrigin
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ class ChangeRequest:
         self.used_override = False
         self._cached_roa_validity: Optional[bool] = None
         self.roa_validator = SingleRouteROAValidator(database_handler)
+        self.scopefilter_validator = ScopeFilterValidator()
 
         try:
             self.rpsl_obj_new = rpsl_object_from_text(rpsl_text_submitted, strict_validation=True)
@@ -130,18 +133,14 @@ class ChangeRequest:
             logger.info(f'{id(self)}: Saving change for {self.rpsl_obj_new}: deleting current object')
             database_handler.delete_rpsl_object(rpsl_object=self.rpsl_obj_current, origin=JournalEntryOrigin.auth_change)
         else:
-            if not self.used_override:
-                self.rpsl_obj_new.overwrite_date_new_changed_attributes(self.rpsl_obj_current)
-                # This call may have emitted a new info message.
-                self._import_new_rpsl_obj_info_messages()
             logger.info(f'{id(self)}: Saving change for {self.rpsl_obj_new}: inserting/updating current object')
             database_handler.upsert_rpsl_object(self.rpsl_obj_new, JournalEntryOrigin.auth_change)
         self.status = UpdateRequestStatus.SAVED
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return self.status in [UpdateRequestStatus.SAVED, UpdateRequestStatus.PROCESSING]
 
-    def submitter_report(self) -> str:
+    def submitter_report_human(self) -> str:
         """Produce a string suitable for reporting back status and messages to the human submitter."""
         status = 'succeeded' if self.is_valid() else 'FAILED'
 
@@ -154,6 +153,22 @@ class ChangeRequest:
             report += ''.join([f'ERROR: {e}\n' for e in self.error_messages])
             report += ''.join([f'INFO: {e}\n' for e in self.info_messages])
         return report
+
+    def submitter_report_json(self) -> Dict[str, Union[None, bool, str, List[str]]]:
+        """Produce a dict suitable for reporting back status and messages in JSON."""
+        new_object_text = None
+        if self.rpsl_obj_new and not self.error_messages:
+            new_object_text = self.rpsl_obj_new.render_rpsl_text()
+        return {
+            'successful': self.is_valid(),
+            'type': str(self.request_type.value) if self.request_type else None,
+            'object_class': self.object_class_str(),
+            'rpsl_pk': self.object_pk_str(),
+            'info_messages': self.info_messages,
+            'error_messages': self.error_messages,
+            'new_object_text': new_object_text,
+            'submitted_object_text': self.rpsl_text_submitted,
+        }
 
     def notification_target_report(self):
         """
@@ -218,13 +233,18 @@ class ChangeRequest:
         return targets
 
     def validate(self) -> bool:
+        if self.rpsl_obj_new and self.request_type == UpdateRequestType.CREATE:
+            if not self.rpsl_obj_new.clean_for_create():
+                self.error_messages += self.rpsl_obj_new.messages.errors()
+                self.status = UpdateRequestStatus.ERROR_PARSING
+                return False
         auth_valid = self._check_auth()
         if not auth_valid:
             return False
         references_valid = self._check_references()
-        self.notification_targets()
         rpki_valid = self._check_conflicting_roa()
-        return references_valid and rpki_valid
+        scopefilter_valid = self._check_scopefilter()
+        return references_valid and rpki_valid and scopefilter_valid
 
     def _check_auth(self) -> bool:
         assert self.rpsl_obj_new
@@ -304,16 +324,21 @@ class ChangeRequest:
         self._cached_roa_validity = True
         return True
 
-    def _import_new_rpsl_obj_info_messages(self):
-        """
-        Import new info messages from self.rpsl_obj_new.
-        This is used after overwrite_date_new_changed_attributes()
-        is called, as it's called just before saving, but may
-        emit a new info message.
-        """
-        for info_message in self.rpsl_obj_new.messages.infos():
-            if info_message not in self.info_messages:
-                self.info_messages.append(info_message)
+    def _check_scopefilter(self) -> bool:
+        if self.request_type == UpdateRequestType.DELETE or not self.rpsl_obj_new:
+            return True
+        result, comment = self.scopefilter_validator.validate_rpsl_object(self.rpsl_obj_new)
+        if result in [ScopeFilterStatus.out_scope_prefix, ScopeFilterStatus.out_scope_as]:
+            user_message = 'Contains out of scope information: ' + comment
+            if self.request_type == UpdateRequestType.CREATE:
+                logger.debug(f'{id(self)}: object out of scope: ' + comment)
+                if self.is_valid():  # Only change the status if this object was valid prior, so this is first failure
+                    self.status = UpdateRequestStatus.ERROR_SCOPEFILTER
+                self.error_messages.append(user_message)
+                return False
+            elif self.request_type == UpdateRequestType.MODIFY:
+                self.info_messages.append(user_message)
+        return True
 
 
 def parse_change_requests(requests_text: str,

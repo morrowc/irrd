@@ -6,9 +6,10 @@ from irrd.conf import get_setting
 from irrd.rpki.validators import BulkRouteROAValidator
 from irrd.rpsl.parser import UnknownRPSLObjectClassException, RPSLObject
 from irrd.rpsl.rpsl_objects import rpsl_object_from_text, RPSLKeyCert
+from irrd.scopefilter.validators import ScopeFilterValidator
 from irrd.storage.database_handler import DatabaseHandler
 from irrd.storage.models import DatabaseOperation, JournalEntryOrigin
-from irrd.utils.text import split_paragraphs_rpsl
+from irrd.utils.text import split_paragraphs_rpsl, remove_last_modified
 from .nrtm_operation import NRTMOperation
 from ..storage.queries import RPSLDatabaseQuery
 
@@ -63,6 +64,7 @@ class MirrorFileImportParserBase(MirrorParser):
         self.obj_ignored_class = 0  # Objects ignored due to object_class_filter setting
         self.obj_unknown = 0  # Objects with unknown classes
         self.unknown_object_classes: Set[str] = set()  # Set of encountered unknown classes
+        self.scopefilter_validator = ScopeFilterValidator()
         super().__init__()
 
     def _parse_object(self, rpsl_text: str) -> Optional[RPSLObject]:
@@ -111,6 +113,8 @@ class MirrorFileImportParserBase(MirrorParser):
                     str(obj.ip_first), obj.prefix_length, obj.asn_first, obj.source()
                 )
 
+            obj.scopefilter_status, _ = self.scopefilter_validator.validate_rpsl_object(obj)
+
             return obj
 
         except UnknownRPSLObjectClassException as e:
@@ -139,7 +143,7 @@ class MirrorFileImportParser(MirrorFileImportParserBase):
     def __init__(self, serial: Optional[int]=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.serial = serial
-        logger.debug(f'Starting file import of {self.source} from {self.filename}, setting serial {serial}')
+        logger.debug(f'Starting file import of {self.source} from {self.filename}')
 
     def run_import(self) -> Optional[str]:
         """
@@ -160,7 +164,8 @@ class MirrorFileImportParser(MirrorFileImportParserBase):
 
         self.log_report()
         f.close()
-        self.database_handler.record_serial_seen(self.source, self.serial if self.serial else 1)
+        if self.serial:
+            self.database_handler.record_serial_seen(self.source, self.serial)
 
         return None
 
@@ -170,7 +175,7 @@ class MirrorFileImportParser(MirrorFileImportParserBase):
                     f'{obj_successful} objects inserted, '
                     f'ignored {self.obj_errors} due to errors, '
                     f'ignored {self.obj_ignored_class} due to object_class_filter, '
-                    f'serial {self.serial}, source {self.filename}')
+                    f'source {self.filename}')
         if self.obj_unknown:
             unknown_formatted = ', '.join(self.unknown_object_classes)
             logger.warning(f'Ignored {self.obj_unknown} objects found in file import for {self.source} due to unknown '
@@ -247,7 +252,7 @@ class MirrorUpdateFileImportParser(MirrorFileImportParserBase):
                 file_obj = file_objs_by_pk[row['rpsl_pk']]
             except KeyError:
                 continue
-            if file_obj.render_rpsl_text() != row['object_text']:
+            if file_obj.render_rpsl_text() != remove_last_modified(row['object_text']):
                 self.database_handler.upsert_rpsl_object(file_obj, JournalEntryOrigin.synthetic_nrtm)
                 self.obj_modified += 1
 

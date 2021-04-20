@@ -4,6 +4,7 @@ from typing import Optional, List
 from irrd.rpki.validators import SingleRouteROAValidator
 from irrd.rpsl.parser import UnknownRPSLObjectClassException
 from irrd.rpsl.rpsl_objects import rpsl_object_from_text, RPSLKeyCert
+from irrd.scopefilter.validators import ScopeFilterValidator
 from irrd.storage.database_handler import DatabaseHandler
 from irrd.storage.models import DatabaseOperation, JournalEntryOrigin
 
@@ -72,13 +73,17 @@ class NRTMOperation:
             if self.rpki_aware and obj.rpki_relevant and obj.prefix and obj.asn_first:
                 roa_validator = SingleRouteROAValidator(database_handler)
                 obj.rpki_status = roa_validator.validate_route(obj.prefix, obj.asn_first, obj.source())
-            database_handler.upsert_rpsl_object(obj, JournalEntryOrigin.mirror)
+            scope_validator = ScopeFilterValidator()
+            obj.scopefilter_status, _ = scope_validator.validate_rpsl_object(obj)
+            database_handler.upsert_rpsl_object(obj, JournalEntryOrigin.mirror,
+                                                source_serial=self.serial)
         elif self.operation == DatabaseOperation.delete:
-            database_handler.delete_rpsl_object(rpsl_object=obj, origin=JournalEntryOrigin.mirror)
+            database_handler.delete_rpsl_object(rpsl_object=obj, origin=JournalEntryOrigin.mirror,
+                                                source_serial=self.serial)
 
         log = f'Completed NRTM operation {str(self)}/{obj.rpsl_object_class}/{obj.pk()}'
         if self.rpki_aware and obj.rpki_relevant:
-            log += ', RPKI status {obj.rpki_status.value}'
+            log += f', RPKI status {obj.rpki_status.value}'
         logger.info(log)
         return True
 

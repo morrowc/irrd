@@ -1,4 +1,5 @@
 import datetime
+import itertools
 import json
 import re
 from collections import OrderedDict, Counter
@@ -6,10 +7,12 @@ from typing import Dict, List, Optional, Tuple, Any, Set
 
 from IPy import IP
 
-from irrd.rpsl.parser_state import RPSLParserMessages
 from irrd.rpki.status import RPKIStatus
+from irrd.rpsl.parser_state import RPSLParserMessages
+from irrd.scopefilter.status import ScopeFilterStatus
 from irrd.utils.text import splitline_unicodesafe
 from .fields import RPSLTextField
+from ..conf import get_setting
 
 RPSL_ATTRIBUTE_TEXT_WIDTH = 16
 TypeRPSLObjectData = List[Tuple[str, str, List[str]]]
@@ -33,6 +36,9 @@ class RPSLObjectMeta(type):
             cls.attrs_allowed = [field[0] for field in fields.items()]
             cls.attrs_required = [field[0] for field in fields.items() if not field[1].optional]
             cls.attrs_multiple = [field[0] for field in fields.items() if field[1].multiple]
+            cls.field_extracts = list(itertools.chain(
+                *[field[1].extracts for field in fields.items() if field[1].primary_key or field[1].lookup_key]
+            ))
             cls.referring_strong_fields = [(field[0], field[1].referring) for field in fields.items() if hasattr(field[1], 'referring') and getattr(field[1], 'strong')]
 
 
@@ -58,9 +64,10 @@ class RPSLObject(metaclass=RPSLObjectMeta):
     ip_last: IP = None
     asn_first: Optional[int] = None
     asn_last: Optional[int] = None
-    prefix: IP = None  # Note: not saved to DB, used for performance
+    prefix: IP = None
     prefix_length: Optional[int] = None
     rpki_status: RPKIStatus = RPKIStatus.not_found
+    scopefilter_status: ScopeFilterStatus = ScopeFilterStatus.in_scope
     default_source: Optional[str] = None  # noqa: E704 (flake8 bug)
     # Whether this object has a relation to RPKI ROA data, and therefore RPKI
     # checks should be performed in certain scenarios. Enabled for route/route6.
@@ -154,10 +161,18 @@ class RPSLObject(metaclass=RPSLObjectMeta):
                     result.add(field_name)
         return result
 
-    def render_rpsl_text(self) -> str:
-        """Render the RPSL object as an RPSL string."""
+    def render_rpsl_text(self, last_modified: datetime.datetime=None) -> str:
+        """
+        Render the RPSL object as an RPSL string.
+        If last_modified is provided, removes existing last-modified:
+        attributes and adds a new one with that timestamp, if self.source()
+        is authoritative.
+        """
         output = ""
+        authoritative = get_setting(f'sources.{self.source()}.authoritative')
         for attr, value, continuation_chars in self._object_data:
+            if authoritative and last_modified and attr == 'last-modified':
+                continue
             attr_display = f'{attr}:'.ljust(RPSL_ATTRIBUTE_TEXT_WIDTH)
             value_lines = list(splitline_unicodesafe(value))
             if not value_lines:
@@ -172,6 +187,10 @@ class RPSLObject(metaclass=RPSLObjectMeta):
                         continuation_char = '+'
                     output += continuation_char + (RPSL_ATTRIBUTE_TEXT_WIDTH - 1) * ' ' + line
                 output += '\n'
+        if authoritative and last_modified:
+            output += 'last-modified:'.ljust(RPSL_ATTRIBUTE_TEXT_WIDTH)
+            output += last_modified.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+            output += '\n'
         return output
 
     def generate_template(self):
@@ -197,6 +216,15 @@ class RPSLObject(metaclass=RPSLObjectMeta):
         return template
 
     def clean(self) -> bool:
+        """
+        Additional cleaning steps for some objects.
+        """
+        return True
+
+    def clean_for_create(self) -> bool:
+        """
+        Additional cleaning steps for creations only.
+        """
         return True
 
     def _extract_attributes_values(self, text: str) -> None:
@@ -415,45 +443,6 @@ class RPSLObject(metaclass=RPSLObjectMeta):
         for new_value in new_values:
             self._object_data.insert(insert_idx, (attribute, new_value, []))
             insert_idx += 1
-
-    def overwrite_date_new_changed_attributes(self, existing_obj=None) -> None:
-        """
-        Overwrite the date in any newly added changed: attributes per #242.
-        Which changed: lines are new is determined by comparing to existing_obj,
-        which should be another RPSLObject, or None if all changed: lines
-        should be considered new.
-        """
-        parsed_values_to_overwrite = set(self.parsed_data['changed'])
-        if existing_obj:
-            parsed_values_to_overwrite -= set(existing_obj.parsed_data['changed'])
-
-        # As the value is already validated by RPSLChangedField,
-        # we can safely make assumptions on the format.
-        new_object_data = []
-        removed_values_with_comment: List[Tuple[int, str]] = []
-        for idx, (attr_name, attr_value, continuation_chars) in enumerate(self._object_data):
-            if attr_name == 'changed':
-                attr_value_clean = attr_value.split('#')[0].strip()
-                if attr_value_clean in parsed_values_to_overwrite:
-                    removed_values_with_comment.append((idx, attr_value))
-                    continue
-            new_object_data.append((attr_name, attr_value, continuation_chars))
-        self._object_data = new_object_data
-
-        current_date = datetime.datetime.now().strftime('%Y%m%d')
-        for idx, value in removed_values_with_comment:
-            try:
-                content, comment = map(str.strip, value.split('#'))
-            except ValueError:
-                content = value.strip()
-                comment = ''
-            email = content.split(' ')[0]  # Ignore existing date
-            if comment:
-                new_value = f'{email} {current_date} # {comment}'
-            else:
-                new_value = f'{email} {current_date}'
-            self._object_data.insert(idx, ('changed', new_value, []))
-            self.messages.info(f'Set date in changed line "{value}" to today.')
 
     def __repr__(self):
         source = self.parsed_data.get('source', '')

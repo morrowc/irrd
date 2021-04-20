@@ -2,13 +2,16 @@
 Release notes for IRRd 4.1.0
 ============================
 
-IRRd 4.1.0 adds :doc:`RPKI-aware mode </admins/rpki>`
-and a new daemon architecture with full multiprocessing,
-along with several other improvements.
+IRRd 4.1.0 adds several major new features, including
+:doc:`RPKI-aware mode </admins/rpki>`,
+a new daemon architecture with full multiprocessing, synthetic NRTM,
+and a scope filter.
 
-IRRd 4.1.0 contains several significant changes, so please
-read these release notes carefully.
+The changes between 4.0.x and 4.1.0 are major. Please read these release
+notes carefully before upgrading.
 Upgrading to IRRd 4.1.0 requires several changes to the deployment setup.
+Downgrading back to IRRd 4.0.x, if needed, also requires steps before
+downgrading the installed IRRd package.
 
 .. contents:: :backlinks: none
 
@@ -64,25 +67,43 @@ for further details.
 
 Other changes
 ~~~~~~~~~~~~~
+* A :doc:`scopefilter </admins/scopefilter>` has been added. This allows you
+  to filter RPSL objects matching certain prefixes and AS numbers from your
+  IRRd instance. By default, the scope filter is disabled.
 * The default for ``server.whois.max_connections`` has been reduced from 50
   to 10. In 4.1, IRRd whois workers use considerably more memory, about 200 MB
   each, and one worker is started for each permitted connection. Therefore,
   at the default 10 connections, the whois processes use about 2 GB of memory,
   at 50 connections, this is about 10 GB.
-* Serial handling in IRRd has changed. If you mirror a source over NRTM, and
-  keep a local journal, IRRd used to keep these serials identical. The NRTM
-  ADD from the original source would be stored in the local journal under the
-  same serial number, unless it was ignored by the object class filter.
-  In 4.1, IRRd always keeps its own range of serials. That means serials for
-  the same change may be different between different mirrors.
-  If users change their NRTM source to a different one, they should reload the
-  entire database from that source, not just resume NRTM streaming. Simply
-  changing the NRTM host may lead to missing data.
+* The ``last-modified`` attribute is set every time an object is created or
+  updated in an authoritative source. You can apply this to all existing
+  authoritative objects with the
+  :ref:`new irrd_set_last_modified_auth command <last-modified>`.
+* Serial handling in IRRd has changed for NRTM mirrors. If you mirror a
+  source over NRTM, and keep a local journal, IRRd used to keep these serials
+  identical. The NRTM ADD from the original source would be stored in the local
+  journal under the same serial number, unless it was ignored by the object
+  class filter.
+  In 4.1, if you enable RPKI-aware mode or the scope filter for a source, or
+  it has been enabled at any point since the last full reload, IRRd keeps its
+  own serial number range in the local journal for that source. This may be out
+  of sync with the NRTM source. Different IRRd instances mirroring from the
+  same NRTM source may have different serial numbers for the same change.
+  If neither RPKI-aware mode nor the scope filter is enabled, and hasn't been
+  since the last full reload, IRRd synchronises the local serials with the
+  NRTM source, the default behaviour in 4.0.
+  See the :ref`NRTM serial handling documentation <mirroring-nrtm-serials>`
+  for further details.
+* When users create `route(6)` objects in authoritative databases, IRRd
+  also verifies authorisation from
+  :ref:`related object maintainers <auth-related-mntners>`. This behaviour
+  is enabled by default, but can be disabled with the
+  ``auth.authenticate_related_mntners`` setting.
 * The ``!j`` command has changed, and now is exclusively used to check
   mirroring status. It returns what the most recent serial processed from a
   mirror is. For more extensive status information, like the local serials
   in the journal,
-  :doc:`use the new !J command </users/queries>`.
+  :doc:`use the new !J command </users/queries/whois>`.
 * IRRd starts a maximum of three mirror processes at the same time,
   to reduce peak loads. A further three, if needed, are started 15 seconds
   later, regardless of whether the previous ones have finished.
@@ -93,7 +114,10 @@ Other changes
   information on these options.
 * RIPE style query responses now always end with two empty lines,
   `consistent with the RIPE database`_.
+* A custom flexible logging config can now be set with the
+  ``log.logging_config_path``.
 * A timeout was added for FTP connections.
+* Memory usage during large RPSL imports has been reduced.
 * A bug was fixed where some invalid objects could cause parser exceptions.
 
 
@@ -129,6 +153,9 @@ whether RPKI-aware mode is enabled or not.
 * Ensure that RPKI-aware mode is configured as desired. By default it is
   **enabled**.
 * Start IRRd and re-enable the cron / e-mail triggered tasks.
+* If you would like to set ``last-modified`` for existing authoritative
+  objects, use the
+  :ref:`new irrd_set_last_modified_auth command <last-modified>`.
 
 
 Downgrading from 4.1 to 4.0.x

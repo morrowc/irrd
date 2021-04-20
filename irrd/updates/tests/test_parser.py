@@ -1,6 +1,5 @@
 # flake8: noqa: W293
 import itertools
-
 import textwrap
 from unittest.mock import Mock
 
@@ -10,13 +9,16 @@ from pytest import raises
 
 from irrd.conf import PASSWORD_HASH_DUMMY_VALUE
 from irrd.rpki.status import RPKIStatus
-from irrd.utils.text import splitline_unicodesafe
-from irrd.utils.rpsl_samples import SAMPLE_INETNUM, SAMPLE_AS_SET, SAMPLE_PERSON, SAMPLE_MNTNER, SAMPLE_ROUTE
+from irrd.scopefilter.status import ScopeFilterStatus
+from irrd.scopefilter.validators import ScopeFilterValidator
+from irrd.storage.models import JournalEntryOrigin
+from irrd.utils.rpsl_samples import SAMPLE_INETNUM, SAMPLE_AS_SET, SAMPLE_PERSON, SAMPLE_MNTNER, \
+    SAMPLE_ROUTE, SAMPLE_ROUTE6
 from irrd.utils.test_utils import flatten_mock_calls
+from irrd.utils.text import splitline_unicodesafe
 from ..parser import parse_change_requests
 from ..parser_state import UpdateRequestType, UpdateRequestStatus
-from ..validators import ReferenceValidator, AuthValidator
-from ...storage.models import JournalEntryOrigin
+from ..validators import ReferenceValidator, AuthValidator, ValidatorResult
 
 
 @pytest.fixture()
@@ -27,6 +29,11 @@ def prepare_mocks(monkeypatch):
     mock_dq = Mock()
     monkeypatch.setattr('irrd.updates.parser.RPSLDatabaseQuery', lambda: mock_dq)
     monkeypatch.setattr('irrd.updates.validators.RPSLDatabaseQuery', lambda: mock_dq)
+
+    mock_scopefilter = Mock(spec=ScopeFilterValidator)
+    monkeypatch.setattr('irrd.updates.parser.ScopeFilterValidator',
+                        lambda: mock_scopefilter)
+    mock_scopefilter.validate_rpsl_object = lambda obj: (ScopeFilterStatus.in_scope, '')
     yield mock_dq, mock_dh
 
 
@@ -77,7 +84,7 @@ class TestSingleChangeRequestHandling:
         assert result_invalid.rpsl_text_submitted.startswith('aut-num:')
         assert result_invalid.rpsl_obj_new.rpsl_object_class == 'aut-num'
         assert not result_invalid.info_messages
-        assert len(result_invalid.error_messages) == 6
+        assert len(result_invalid.error_messages) == 5
         assert 'Mandatory attribute' in result_invalid.error_messages[0]
 
         assert auth_validator.passwords == ['pw1', 'pw2', 'pw3']
@@ -109,6 +116,30 @@ class TestSingleChangeRequestHandling:
         assert result.status == UpdateRequestStatus.ERROR_NON_AUTHORITIVE
         assert not result.is_valid()
         assert result.error_messages == ['This instance is not authoritative for source TEST2']
+
+    def test_validates_for_create(self, prepare_mocks):
+        mock_dq, mock_dh = prepare_mocks
+
+        mock_dh.execute_query = lambda query: []
+
+        auth_validator = Mock()
+        invalid_auth_result = ValidatorResult()
+        invalid_auth_result.error_messages.add('error catch')
+        auth_validator.process_auth = lambda new, cur: invalid_auth_result
+
+        invalid_create_text = SAMPLE_AS_SET.replace('AS65537:AS-SETTEST', 'AS-SETTEST')
+        result = parse_change_requests(invalid_create_text, mock_dh, auth_validator, None)[0]
+
+        assert not result.validate()
+        assert result.status == UpdateRequestStatus.ERROR_PARSING
+        assert len(result.error_messages) == 1
+        assert 'AS set names must be hierarchical and the first' in result.error_messages[0]
+
+        # Test again with an UPDATE (which then fails on auth to stop)
+        mock_dh.execute_query = lambda query: [{'object_text': SAMPLE_AS_SET}]
+        result = parse_change_requests(invalid_create_text, mock_dh, auth_validator, None)[0]
+        assert not result.validate()
+        assert result.error_messages == ['error catch']
 
     def test_save_nonexistent_object(self, prepare_mocks):
         mock_dq, mock_dh = prepare_mocks
@@ -396,7 +427,7 @@ class TestSingleChangeRequestHandling:
             ['rpsl_pk', ('TEST-MNT',), {}],
         ]
 
-    def test_check_auth_invalid_create_mntner_referencing_self_wrong_password(self, prepare_mocks):
+    def test_check_auth_invalid_create_mntner_referencing_self_wrong_override_password(self, prepare_mocks):
         mock_dq, mock_dh = prepare_mocks
 
         mock_dh.execute_query = lambda query: []
@@ -669,6 +700,234 @@ class TestSingleChangeRequestHandling:
         assert result_inetnum.notification_targets() == {'notify@example.com', 'upd-to@example.net'}
         assert 'Ignoring override password, auth.override_password not set.' in caplog.text
 
+    def test_check_valid_related_mntners_disabled(self, prepare_mocks, config_override):
+        config_override({'auth': {'authenticate_related_mntners': False}})
+        mock_dq, mock_dh = prepare_mocks
+
+        query_answers = [
+            [],  # existing object version
+            [{'object_text': SAMPLE_MNTNER}],  # mntner for object
+            # No further queries expected
+        ]
+        query_results = itertools.cycle(query_answers)
+        mock_dh.execute_query = lambda query: next(query_results)
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        result_route = parse_change_requests(SAMPLE_ROUTE + 'password: md5-password',
+                                             mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_auth()
+        assert not result_route.error_messages
+        assert result_route.notification_targets() == {'mnt-nfy@example.net', 'mnt-nfy2@example.net'}
+
+        assert flatten_mock_calls(mock_dq, flatten_objects=True) == [
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['rpsl_pk', ('192.0.2.0/24AS65537',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'TEST-MNT'},), {}],
+        ]
+
+    def test_check_invalid_related_mntners_inetnum_exact(self, prepare_mocks):
+        mock_dq, mock_dh = prepare_mocks
+
+        # Break the hash so auth fails for the related mntner only
+        related_mntner = SAMPLE_MNTNER.replace('8PCh', 'aaa').replace('upd-to@', 'upd-to-related@')
+
+        query_answers = [
+            [],  # existing object version
+            [{'object_text': SAMPLE_MNTNER}],  # mntner for object
+            [{
+                # attempt to look for exact inetnum
+                'object_class': 'route',
+                'rpsl_pk': '192.0.2.0/24AS65537',
+                'parsed_data': {'mnt-by': ['RELATED-MNT']}
+            }],
+            [{'object_text': related_mntner}],  # related mntner retrieval
+        ]
+        query_results = itertools.cycle(query_answers)
+        mock_dh.execute_query = lambda query: next(query_results)
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        result_route = parse_change_requests(SAMPLE_ROUTE + 'password: md5-password',
+                                             mock_dh, auth_validator, reference_validator)[0]
+        assert not result_route._check_auth()
+        assert result_route.error_messages[0] == (
+            'Authorisation for route 192.0.2.0/24AS65537 failed: must by authenticated by one of: '
+            'RELATED-MNT - from parent route 192.0.2.0/24AS65537')
+        assert result_route.notification_targets() == {'upd-to-related@example.net'}
+
+        assert flatten_mock_calls(mock_dq, flatten_objects=True) == [
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['rpsl_pk', ('192.0.2.0/24AS65537',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'TEST-MNT'},), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_exact', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'RELATED-MNT'},), {}],
+        ]
+
+    def test_check_valid_related_mntners_inet6num_exact(self, prepare_mocks):
+        mock_dq, mock_dh = prepare_mocks
+
+        related_mntner = SAMPLE_MNTNER.replace('TEST-MNT', 'RELATED-MNT')
+
+        query_answers = [
+            [],  # existing object version
+            [{'object_text': SAMPLE_MNTNER}],  # mntner for object
+            [{
+                # attempt to look for exact inetnum
+                'object_class': 'route6',
+                'rpsl_pk': '2001:db8::/48AS65537',
+                'parsed_data': {'mnt-by': ['RELATED-MNT']}
+            }],
+            [{'object_text': related_mntner}],  # related mntner retrieval
+        ]
+        query_results = itertools.cycle(query_answers)
+        mock_dh.execute_query = lambda query: next(query_results)
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        result_route = parse_change_requests(SAMPLE_ROUTE6 + 'password: md5-password',
+                                             mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_auth()
+        assert result_route._check_auth()  # should be cached, no extra db queries
+        assert not result_route.error_messages
+        assert result_route.notification_targets() == {'mnt-nfy2@example.net', 'mnt-nfy@example.net'}
+
+        assert flatten_mock_calls(mock_dq, flatten_objects=True) == [
+            ['sources', (['TEST'],), {}], ['object_classes', (['route6'],), {}],
+            ['rpsl_pk', ('2001:DB8::/48AS65537',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'TEST-MNT'},), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inet6num'],), {}],
+            ['first_only', (), {}], ['ip_exact', ('2001:db8::/48',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'RELATED-MNT'},), {}],
+        ]
+
+    def test_check_valid_related_mntners_inetnum_less_specific(self, prepare_mocks):
+        mock_dq, mock_dh = prepare_mocks
+
+        query_answers = [
+            [],  # existing object version
+            [{'object_text': SAMPLE_MNTNER}],  # mntner for object
+            [],  # attempt to look for exact inetnum
+            [{
+                # attempt to look for less specific inetnum
+                'object_class': 'route',
+                'rpsl_pk': '192.0.2.0/24AS65537',
+                'parsed_data': {'mnt-by': ['RELATED-MNT']}
+            }],
+            [{'object_text': SAMPLE_MNTNER}]  # related mntner retrieval
+        ]
+        query_results = itertools.cycle(query_answers)
+        mock_dh.execute_query = lambda query: next(query_results)
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        result_route = parse_change_requests(SAMPLE_ROUTE + 'password: md5-password',
+                                             mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_auth()
+        assert not result_route.error_messages
+        assert result_route.notification_targets() == {'mnt-nfy2@example.net', 'mnt-nfy@example.net'}
+
+        assert flatten_mock_calls(mock_dq, flatten_objects=True) == [
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['rpsl_pk', ('192.0.2.0/24AS65537',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'TEST-MNT'},), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_exact', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_less_specific_one_level', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'RELATED-MNT'},), {}],
+        ]
+
+    def test_check_valid_related_mntners_route(self, prepare_mocks):
+        mock_dq, mock_dh = prepare_mocks
+
+        query_answers = [
+            [],  # existing object version
+            [{'object_text': SAMPLE_MNTNER}],  # mntner for object
+            [],  # attempt to look for exact inetnum
+            [],  # attempt to look for less specific inetnum
+            [{
+                # attempt to look for less specific route
+                'object_class': 'route',
+                'rpsl_pk': '192.0.2.0/24AS65537',
+                'parsed_data': {'mnt-by': ['RELATED-MNT']}
+            }],
+            [{'object_text': SAMPLE_MNTNER}]  # related mntner retrieval
+        ]
+        query_results = itertools.cycle(query_answers)
+        mock_dh.execute_query = lambda query: next(query_results)
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        result_route = parse_change_requests(SAMPLE_ROUTE + 'password: md5-password',
+                                             mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_auth()
+        assert not result_route.error_messages
+        assert result_route.notification_targets() == {'mnt-nfy2@example.net', 'mnt-nfy@example.net'}
+
+        assert flatten_mock_calls(mock_dq, flatten_objects=True) == [
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['rpsl_pk', ('192.0.2.0/24AS65537',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'TEST-MNT'},), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_exact', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_less_specific_one_level', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['first_only', (), {}], ['ip_less_specific_one_level', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'RELATED-MNT'},), {}],
+        ]
+
+    def test_check_valid_no_related_mntners(self, prepare_mocks):
+        mock_dq, mock_dh = prepare_mocks
+
+        query_answers = [
+            [],  # existing object version
+            [{'object_text': SAMPLE_MNTNER}],  # mntner for object
+            [],  # attempt to look for exact inetnum
+            [],  # attempt to look for less specific inetnum
+            [],  # attempt to look for less specific route
+        ]
+        query_results = itertools.cycle(query_answers)
+        mock_dh.execute_query = lambda query: next(query_results)
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        result_route = parse_change_requests(SAMPLE_ROUTE + 'password: md5-password',
+                                             mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_auth()
+        assert not result_route.error_messages
+        assert result_route.notification_targets() == {'mnt-nfy2@example.net', 'mnt-nfy@example.net'}
+
+        assert flatten_mock_calls(mock_dq, flatten_objects=True) == [
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['rpsl_pk', ('192.0.2.0/24AS65537',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['mntner'],), {}],
+            ['rpsl_pks', ({'TEST-MNT'},), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_exact', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['inetnum'],), {}],
+            ['first_only', (), {}], ['ip_less_specific_one_level', ('192.0.2.0/24',), {}],
+            ['sources', (['TEST'],), {}], ['object_classes', (['route'],), {}],
+            ['first_only', (), {}], ['ip_less_specific_one_level', ('192.0.2.0/24',), {}],
+        ]
+
     def test_rpki_validation(self, prepare_mocks, monkeypatch, config_override):
         config_override({'rpki': {'roa_source': None}})
         mock_roa_validator = Mock()
@@ -723,6 +982,43 @@ class TestSingleChangeRequestHandling:
         result_route = parse_change_requests(obj_text, mock_dh, auth_validator, reference_validator)[0]
         assert result_route._check_conflicting_roa()
 
+    def test_scopefilter_validation(self, prepare_mocks, monkeypatch, config_override):
+        mock_scopefilter_validator = Mock(spec=ScopeFilterValidator)
+        monkeypatch.setattr('irrd.updates.parser.ScopeFilterValidator', lambda: mock_scopefilter_validator)
+        mock_dq, mock_dh = prepare_mocks
+
+        reference_validator = ReferenceValidator(mock_dh)
+        auth_validator = AuthValidator(mock_dh)
+
+        # New object, in scope
+        mock_dh.execute_query = lambda query: []
+        mock_scopefilter_validator.validate_rpsl_object = lambda obj: (ScopeFilterStatus.in_scope, '')
+        result_route = parse_change_requests(SAMPLE_ROUTE, mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_scopefilter()
+        assert not result_route.error_messages
+
+        # New object, out of scope
+        mock_dh.execute_query = lambda query: []
+        mock_scopefilter_validator.validate_rpsl_object = lambda obj: (ScopeFilterStatus.out_scope_as, 'out of scope AS')
+        result_route = parse_change_requests(SAMPLE_ROUTE, mock_dh, auth_validator, reference_validator)[0]
+        assert not result_route._check_scopefilter()
+        assert result_route.error_messages[0] == 'Contains out of scope information: out of scope AS'
+
+        # Update object, out of scope, permitted
+        mock_dh.execute_query = lambda query: [{'object_text': SAMPLE_ROUTE}]
+        mock_scopefilter_validator.validate_rpsl_object = lambda obj: (ScopeFilterStatus.out_scope_prefix, 'out of scope prefix')
+        result_route = parse_change_requests(SAMPLE_ROUTE, mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_scopefilter()
+        assert not result_route.error_messages
+        assert result_route.info_messages[1] == 'Contains out of scope information: out of scope prefix'
+
+        # Delete object, out of scope
+        mock_dh.execute_query = lambda query: [{'object_text': SAMPLE_ROUTE}]
+        mock_scopefilter_validator.validate_rpsl_object = lambda obj: (ScopeFilterStatus.out_scope_as, 'out of scope AS')
+        obj_text = SAMPLE_ROUTE + 'delete: delete'
+        result_route = parse_change_requests(obj_text, mock_dh, auth_validator, reference_validator)[0]
+        assert result_route._check_scopefilter()
+
     def test_user_report(self, prepare_mocks):
         mock_dq, mock_dh = prepare_mocks
 
@@ -734,16 +1030,16 @@ class TestSingleChangeRequestHandling:
 
         result_inetnum, result_as_set, result_unknown, result_invalid = parse_change_requests(
             self._request_text(), mock_dh, AuthValidator(mock_dh), None)
-        report_inetnum = result_inetnum.submitter_report()
-        report_as_set = result_as_set.submitter_report()
-        report_unknown = result_unknown.submitter_report()
-        report_invalid = result_invalid.submitter_report()
+        report_inetnum = result_inetnum.submitter_report_human()
+        report_as_set = result_as_set.submitter_report_human()
+        report_unknown = result_unknown.submitter_report_human()
+        report_invalid = result_invalid.submitter_report_human()
 
         assert 'Delete succeeded' in report_inetnum
         assert 'remarks: ' in report_inetnum  # full RPSL object should be included
         assert 'INFO: Address range 192' in report_inetnum
 
-        assert report_as_set == 'Create succeeded: [as-set] AS-SETTEST\n'
+        assert report_as_set == 'Create succeeded: [as-set] AS65537:AS-SETTEST\n'
 
         assert 'FAILED' in report_unknown
         assert 'ERROR: unknown object class' in report_unknown
@@ -767,6 +1063,7 @@ class TestSingleChangeRequestHandling:
             descr:          description
             country:        IT
             notify:         notify@example.com
+            geofeed:        https://example.com/geofeed
             admin-c:        PERSON-TEST
             tech-c:         PERSON-TEST
             status:         ASSIGNED PA
@@ -777,12 +1074,13 @@ class TestSingleChangeRequestHandling:
         """).strip() + '\n'
 
         assert result_as_set.notification_target_report() == textwrap.dedent("""
-            Create succeeded for object below: [as-set] AS-SETTEST:
+            Create succeeded for object below: [as-set] AS65537:AS-SETTEST:
             
-            as-set:         AS-SETTEST
+            as-set:         AS65537:AS-SETTEST
             descr:          description
             members:        AS65538,AS65539
             members:        AS65537
+            members:        AS-OTHERSET
             tech-c:         PERSON-TEST
             admin-c:        PERSON-TEST
             notify:         notify@example.com
@@ -797,10 +1095,10 @@ class TestSingleChangeRequestHandling:
         assert result_inetnum_modify.notification_target_report() == textwrap.dedent("""
             Modify succeeded for object below: [inetnum] 192.0.2.0 - 192.0.2.255:
             
-            @@ -3,8 +3,8 @@
-             descr:          description
+            @@ -4,8 +4,8 @@
              country:        IT
              notify:         notify@example.com
+             geofeed:        https://example.com/geofeed
             -admin-c:        PERSON-TEST
             -tech-c:         PERSON-TEST
             +admin-c:        NEW-TEST
@@ -816,6 +1114,7 @@ class TestSingleChangeRequestHandling:
             descr:          description
             country:        IT
             notify:         notify@example.com
+            geofeed:        https://example.com/geofeed
             admin-c:        NEW-TEST
             tech-c:         NEW-TEST
             status:         ASSIGNED PA
@@ -830,10 +1129,10 @@ class TestSingleChangeRequestHandling:
         assert result_inetnum_modify.notification_target_report() == textwrap.dedent("""
             Modify FAILED AUTHORISATION for object below: [inetnum] 192.0.2.0 - 192.0.2.255:
             
-            @@ -3,8 +3,8 @@
-             descr:          description
+            @@ -4,8 +4,8 @@
              country:        IT
              notify:         notify@example.com
+             geofeed:        https://example.com/geofeed
             -admin-c:        PERSON-TEST
             -tech-c:         PERSON-TEST
             +admin-c:        NEW-TEST
@@ -849,6 +1148,7 @@ class TestSingleChangeRequestHandling:
             descr:          description
             country:        IT
             notify:         notify@example.com
+            geofeed:        https://example.com/geofeed
             admin-c:        NEW-TEST
             tech-c:         NEW-TEST
             status:         ASSIGNED PA

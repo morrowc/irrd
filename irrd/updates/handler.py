@@ -1,9 +1,9 @@
-from collections import defaultdict
-
 import logging
 import textwrap
+from collections import defaultdict
+from typing import List, Optional, Dict, Any, Union
+
 from ordered_set import OrderedSet
-from typing import List, Optional, Dict
 
 from irrd.conf import get_setting
 from irrd.storage.database_handler import DatabaseHandler
@@ -12,6 +12,7 @@ from irrd.utils import email
 from .parser import parse_change_requests, ChangeRequest
 from .parser_state import UpdateRequestStatus, UpdateRequestType
 from .validators import ReferenceValidator, AuthValidator
+from ..utils.validators import RPSLChangeSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +25,63 @@ class ChangeSubmissionHandler:
     those part of the same message, and checking authentication.
     """
 
-    def __init__(self, object_texts: str, pgp_fingerprint: str=None, request_meta: Dict[str, Optional[str]]=None) -> None:
+    def load_text_blob(self, object_texts_blob: str, pgp_fingerprint: str=None, request_meta: Dict[str, Optional[str]]=None):
         self.database_handler = DatabaseHandler()
         self.request_meta = request_meta if request_meta else {}
         self._pgp_key_id = self._resolve_pgp_key_id(pgp_fingerprint) if pgp_fingerprint else None
-        self._handle_object_texts(object_texts)
-        self.database_handler.commit()
-        self.database_handler.close()
 
-    def _handle_object_texts(self, object_texts: str) -> None:
         reference_validator = ReferenceValidator(self.database_handler)
         auth_validator = AuthValidator(self.database_handler, self._pgp_key_id)
-        results = parse_change_requests(object_texts, self.database_handler, auth_validator, reference_validator)
+        change_requests = parse_change_requests(object_texts_blob, self.database_handler,
+                                                auth_validator, reference_validator)
+
+        self._handle_change_requests(change_requests, reference_validator, auth_validator)
+        self.database_handler.commit()
+        self.database_handler.close()
+        return self
+
+    def load_change_submission(self, data: RPSLChangeSubmission, delete=False, request_meta: Dict[str, Optional[str]]=None):
+        self.database_handler = DatabaseHandler()
+        self.request_meta = request_meta if request_meta else {}
+
+        reference_validator = ReferenceValidator(self.database_handler)
+        auth_validator = AuthValidator(self.database_handler)
+        change_requests = []
+
+        delete_reason = None
+        if delete:
+            delete_reason = data.delete_reason
+
+        auth_validator.passwords = data.passwords
+        auth_validator.overrides = [data.override] if data.override else []
+
+        for rpsl_obj in data.objects:
+            object_text = rpsl_obj.object_text
+            if rpsl_obj.attributes:
+                # We don't have a neat way to process individual attribute pairs,
+                # so construct a pseudo-object by appending the text.
+                composite_object = []
+                for attribute in rpsl_obj.attributes:
+                    composite_object.append(attribute.name + ': ' + attribute.value)  # type: ignore
+                object_text = '\n'.join(composite_object) + '\n'
+
+            assert object_text  # enforced by pydantic
+            change_requests.append(ChangeRequest(
+                object_text,
+                self.database_handler,
+                auth_validator,
+                reference_validator,
+                delete_reason
+            ))
+
+        self._handle_change_requests(change_requests, reference_validator, auth_validator)
+        self.database_handler.commit()
+        self.database_handler.close()
+        return self
+
+    def _handle_change_requests(self, change_requests: List[ChangeRequest],
+                             reference_validator: ReferenceValidator,
+                             auth_validator: AuthValidator) -> None:
 
         # When an object references another object, e.g. tech-c referring a person or mntner,
         # an add/update is only valid if those referred objects exist. To complicate matters,
@@ -47,10 +93,10 @@ class ChangeSubmissionHandler:
         # becomes invalid on the first scan, which is why another scan is performed, which
         # will mark B invalid due to the reference to an invalid C, etc. This continues until
         # all references are resolved and repeated scans lead to the same conclusions.
-        valid_changes = [r for r in results if r.is_valid()]
+        valid_changes = [r for r in change_requests if r.is_valid()]
         previous_valid_changes: List[ChangeRequest] = []
         loop_count = 0
-        loop_max = len(results) + 10
+        loop_max = len(change_requests) + 10
 
         while valid_changes != previous_valid_changes:
             previous_valid_changes = valid_changes
@@ -59,7 +105,7 @@ class ChangeSubmissionHandler:
 
             for result in valid_changes:
                 result.validate()
-            valid_changes = [r for r in results if r.is_valid()]
+            valid_changes = [r for r in change_requests if r.is_valid()]
 
             loop_count += 1
             if loop_count > loop_max:  # pragma: no cover
@@ -68,11 +114,11 @@ class ChangeSubmissionHandler:
                 logger.error(msg)
                 raise ValueError(msg)
 
-        for result in results:
+        for result in change_requests:
             if result.is_valid():
                 result.save(self.database_handler)
 
-        self.results = results
+        self.results = change_requests
 
     def _resolve_pgp_key_id(self, pgp_fingerprint: str) -> Optional[str]:
         """
@@ -98,7 +144,7 @@ class ChangeSubmissionHandler:
             return 'SUCCESS'
         return 'FAILED'
 
-    def submitter_report(self) -> str:
+    def submitter_report_human(self) -> str:
         """Produce a human-readable report for the submitter."""
         # flake8: noqa: W293
         successful = [r for r in self.results if r.status == UpdateRequestStatus.SAVED]
@@ -129,10 +175,37 @@ class ChangeSubmissionHandler:
         """)
         for result in self.results:
             user_report += '---\n'
-            user_report += result.submitter_report()
+            user_report += result.submitter_report_human()
             user_report += '\n'
         user_report += '~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n'
         return user_report
+
+    def submitter_report_json(self):
+        """Produce a JSON-ready report for the submitter."""
+        successful = [r for r in self.results if r.status == UpdateRequestStatus.SAVED]
+        failed = [r for r in self.results if r.status != UpdateRequestStatus.SAVED]
+        number_successful_create = len([r for r in successful if r.request_type == UpdateRequestType.CREATE])
+        number_successful_modify = len([r for r in successful if r.request_type == UpdateRequestType.MODIFY])
+        number_successful_delete = len([r for r in successful if r.request_type == UpdateRequestType.DELETE])
+        number_failed_create = len([r for r in failed if r.request_type == UpdateRequestType.CREATE])
+        number_failed_modify = len([r for r in failed if r.request_type == UpdateRequestType.MODIFY])
+        number_failed_delete = len([r for r in failed if r.request_type == UpdateRequestType.DELETE])
+
+        return {
+            'request_meta': self.request_meta,
+            'summary': {
+                'objects_found': len(self.results),
+                'successful': len(successful),
+                'successful_create': number_successful_create,
+                'successful_modify': number_successful_modify,
+                'successful_delete': number_successful_delete,
+                'failed': len(failed),
+                'failed_create': number_failed_create,
+                'failed_modify': number_failed_modify,
+                'failed_delete': number_failed_delete,
+            },
+            'objects': [result.submitter_report_json() for result in self.results],
+        }
 
     def send_notification_target_reports(self):
         # First key is e-mail address of recipient, second is UpdateRequestStatus.SAVED

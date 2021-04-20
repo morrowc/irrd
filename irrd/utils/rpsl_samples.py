@@ -12,10 +12,11 @@ source:         TEST
 remarks:        remark
 """
 
-SAMPLE_AS_SET = """as-set:         AS-SETTEST
+SAMPLE_AS_SET = """as-set:         AS65537:AS-SETTEST
 descr:          description
 members:        AS65538, AS65539
 members:        AS65537
+members:        AS-OTHERSET
 tech-c:         PERSON-TEST
 admin-c:        PERSON-TEST
 notify:         notify@example.com
@@ -206,6 +207,7 @@ netname:        NET-TEST-V4
 descr:          description
 country:        IT
 notify:         notify@example.com
+geofeed:        https://example.com/geofeed
 admin-c:        PERSON-TEST
 tech-c:         PERSON-TEST
 status:         ASSIGNED PA
@@ -570,6 +572,7 @@ mbrs-by-ref:    TEST-MNT
 tech-c:         PERSON-TEST
 admin-c:        PERSON-TEST
 mnt-by:         TEST-MNT
+members:        RS-OTHER-SET
 mp-members:     2001:0dB8::/48
 changed:        changed@example.com 20190701 # comment
 source:         TEST
@@ -630,7 +633,6 @@ source:         TEST
 
 SAMPLE_MISSING_MANDATORY_ATTRIBUTE = """route:          192.0.2.0/24
 origin:         AS65537
-mnt-by:         TEST-MNT
 source:         TEST
 """
 
@@ -831,7 +833,7 @@ roa-uri:        [optional]   [single]    []
 remarks:        [optional]   [multiple]  []
 notify:         [optional]   [multiple]  []
 mnt-by:         [mandatory]  [multiple]  [look-up key, strong references mntner]
-changed:        [mandatory]  [multiple]  []
+changed:        [optional]   [multiple]  []
 source:         [mandatory]  [single]    []
 """
 
@@ -844,6 +846,6 @@ nic-hdl:   [mandatory]  [single]    [primary/look-up key]
 remarks:   [optional]   [multiple]  []
 notify:    [optional]   [multiple]  []
 mnt-by:    [mandatory]  [multiple]  [look-up key, strong references mntner]
-changed:   [mandatory]  [multiple]  []
+changed:   [optional]   [multiple]  []
 source:    [mandatory]  [single]    []
 """

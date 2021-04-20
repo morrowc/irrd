@@ -1,6 +1,8 @@
 from base64 import b64decode
+from io import BytesIO
 from typing import List
 from unittest.mock import Mock
+from urllib.error import URLError
 
 import pytest
 
@@ -9,7 +11,8 @@ from irrd.rpki.validators import BulkRouteROAValidator
 from irrd.storage.database_handler import DatabaseHandler
 from irrd.utils.test_utils import flatten_mock_calls
 from ..mirror_runners_import import RPSLMirrorImportUpdateRunner, RPSLMirrorFullImportRunner, \
-    NRTMImportUpdateStreamRunner, ROAImportRunner
+    NRTMImportUpdateStreamRunner, ROAImportRunner, ScopeFilterUpdateRunner
+from ...scopefilter.validators import ScopeFilterValidator
 
 
 class TestRPSLMirrorImportUpdateRunner:
@@ -137,22 +140,21 @@ class TestRPSLMirrorFullImportRunner:
         })
 
         mock_dh = Mock()
-        mock_ftp = Mock()
+        request = Mock()
         MockMirrorFileImportParser.rpsl_data_calls = []
         monkeypatch.setattr('irrd.mirroring.mirror_runners_import.MirrorFileImportParser', MockMirrorFileImportParser)
-        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.FTP', lambda url, timeout: mock_ftp)
-        MockMirrorFileImportParser.expected_serial = 424242
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.request', request)
 
         mock_bulk_validator_init = Mock()
         monkeypatch.setattr('irrd.mirroring.mirror_runners_import.BulkRouteROAValidator', mock_bulk_validator_init)
 
         responses = {
             # gzipped data, contains 'source1'
-            'RETR /source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
-            'RETR /source2': b'source2',
-            'RETR /serial': b'424242',
+            'ftp://host/source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
+            'ftp://host/source2': b'source2',
+            'ftp://host/serial': b'424242',
         }
-        mock_ftp.retrbinary = lambda path, callback: callback(responses[path])
+        request.urlopen = lambda url: MockUrlopenResponse(responses[url])
         RPSLMirrorFullImportRunner('TEST').run(mock_dh, serial_newest_mirror=424241)
 
         assert MockMirrorFileImportParser.rpsl_data_calls == ['source1', 'source2']
@@ -162,6 +164,29 @@ class TestRPSLMirrorFullImportRunner:
             ['record_serial_newest_mirror', ('TEST', 424242), {}],
         ]
         assert mock_bulk_validator_init.mock_calls[0][1][0] == mock_dh
+
+    def test_failed_import_ftp(self, monkeypatch, config_override):
+        config_override({
+            'rpki': {'roa_source': 'https://example.com/roa.json'},
+            'sources': {
+                'TEST': {
+                    'import_source': 'ftp://host/source1.gz',
+                }
+            }
+        })
+
+        mock_dh = Mock()
+        request = Mock()
+        MockMirrorFileImportParser.rpsl_data_calls = []
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.MirrorFileImportParser', MockMirrorFileImportParser)
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.request', request)
+
+        mock_bulk_validator_init = Mock()
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.BulkRouteROAValidator', mock_bulk_validator_init)
+
+        request.urlopen = lambda url: MockUrlopenResponse(b'', fail=True)
+        with pytest.raises(IOError):
+            RPSLMirrorFullImportRunner('TEST').run(mock_dh, serial_newest_mirror=424241)
 
     def test_run_import_local_file(self, monkeypatch, config_override, tmpdir):
         tmp_import_source1 = tmpdir + '/source1.rpsl.gz'
@@ -188,7 +213,6 @@ class TestRPSLMirrorFullImportRunner:
         mock_dh = Mock()
         MockMirrorFileImportParser.rpsl_data_calls = []
         monkeypatch.setattr('irrd.mirroring.mirror_runners_import.MirrorFileImportParser', MockMirrorFileImportParser)
-        MockMirrorFileImportParser.expected_serial = 424242
 
         RPSLMirrorFullImportRunner('TEST').run(mock_dh)
 
@@ -210,18 +234,17 @@ class TestRPSLMirrorFullImportRunner:
         })
 
         mock_dh = Mock()
-        mock_ftp = Mock()
+        request = Mock()
         MockMirrorFileImportParser.rpsl_data_calls = []
         monkeypatch.setattr('irrd.mirroring.mirror_runners_import.MirrorFileImportParser', MockMirrorFileImportParser)
-        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.FTP', lambda url, timeout: mock_ftp)
-        MockMirrorFileImportParser.expected_serial = None
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.request', request)
 
         responses = {
             # gzipped data, contains 'source1'
-            'RETR /source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
-            'RETR /source2': b'source2',
+            'ftp://host/source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
+            'ftp://host/source2': b'source2',
         }
-        mock_ftp.retrbinary = lambda path, callback: callback(responses[path])
+        request.urlopen = lambda url: MockUrlopenResponse(responses[url])
         RPSLMirrorFullImportRunner('TEST').run(mock_dh, serial_newest_mirror=42)
 
         assert MockMirrorFileImportParser.rpsl_data_calls == ['source1', 'source2']
@@ -241,19 +264,18 @@ class TestRPSLMirrorFullImportRunner:
         })
 
         mock_dh = Mock()
-        mock_ftp = Mock()
+        request = Mock()
         MockMirrorFileImportParser.rpsl_data_calls = []
         monkeypatch.setattr('irrd.mirroring.mirror_runners_import.MirrorFileImportParser', MockMirrorFileImportParser)
-        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.FTP', lambda url, timeout: mock_ftp)
-        MockMirrorFileImportParser.expected_serial = 424242
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.request', request)
 
         responses = {
             # gzipped data, contains 'source1'
-            'RETR /source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
-            'RETR /source2': b'source2',
-            'RETR /serial': b'424242',
+            'ftp://host/source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
+            'ftp://host/source2': b'source2',
+            'ftp://host/serial': b'424242',
         }
-        mock_ftp.retrbinary = lambda path, callback: callback(responses[path])
+        request.urlopen = lambda url: MockUrlopenResponse(responses[url])
         RPSLMirrorFullImportRunner('TEST').run(mock_dh, serial_newest_mirror=424243)
 
         assert not MockMirrorFileImportParser.rpsl_data_calls
@@ -272,19 +294,18 @@ class TestRPSLMirrorFullImportRunner:
         })
 
         mock_dh = Mock()
-        mock_ftp = Mock()
+        request = Mock()
         MockMirrorFileImportParser.rpsl_data_calls = []
         monkeypatch.setattr('irrd.mirroring.mirror_runners_import.MirrorFileImportParser', MockMirrorFileImportParser)
-        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.FTP', lambda url, timeout: mock_ftp)
-        MockMirrorFileImportParser.expected_serial = 424242
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.request', request)
 
         responses = {
             # gzipped data, contains 'source1'
-            'RETR /source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
-            'RETR /source2': b'source2',
-            'RETR /serial': b'424242',
+            'ftp://host/source1.gz': b64decode('H4sIAE4CfFsAAyvOLy1KTjUEAE5Fj0oHAAAA'),
+            'ftp://host/source2': b'source2',
+            'ftp://host/serial': b'424242',
         }
-        mock_ftp.retrbinary = lambda path, callback: callback(responses[path])
+        request.urlopen = lambda url: MockUrlopenResponse(responses[url])
         RPSLMirrorFullImportRunner('TEST').run(mock_dh, serial_newest_mirror=424243, force_reload=True)
 
         assert MockMirrorFileImportParser.rpsl_data_calls == ['source1', 'source2']
@@ -323,14 +344,20 @@ class TestRPSLMirrorFullImportRunner:
         assert 'scheme gopher is not supported' in str(ve.value)
 
 
+class MockUrlopenResponse(BytesIO):
+    def __init__(self, bytes: bytes, fail: bool=False):
+        if fail:
+            raise URLError('error')
+        super().__init__(bytes)
+
+
 class MockMirrorFileImportParser:
     rpsl_data_calls: List[str] = []
-    expected_serial = 424242
 
     def __init__(self, source, filename, serial, database_handler, direct_error_return=False, roa_validator=None):
         self.filename = filename
         assert source == 'TEST'
-        assert serial == self.expected_serial
+        assert serial is None
 
     def run_import(self):
         with open(self.filename, 'r') as f:
@@ -381,7 +408,7 @@ class TestROAImportRunner:
         assert flatten_mock_calls(mock_dh) == [
             ['disable_journaling', (), {}],
             ['delete_all_roa_objects', (), {}],
-            ['delete_all_rpsl_objects_with_journal', ('RPKI',), {}],
+            ['delete_all_rpsl_objects_with_journal', ('RPKI',), {'journal_guaranteed_empty': True}],
             ['commit', (), {}],
             ['enable_journaling', (), {}],
             ['update_rpki_status', (), {
@@ -440,7 +467,7 @@ class TestROAImportRunner:
         assert flatten_mock_calls(mock_dh) == 2 * [
             ['disable_journaling', (), {}],
             ['delete_all_roa_objects', (), {}],
-            ['delete_all_rpsl_objects_with_journal', ('RPKI',), {}],
+            ['delete_all_rpsl_objects_with_journal', ('RPKI',), {'journal_guaranteed_empty': True}],
             ['close', (), {}]
         ]
 
@@ -462,7 +489,7 @@ class TestROAImportRunner:
         assert flatten_mock_calls(mock_dh) == [
             ['disable_journaling', (), {}],
             ['delete_all_roa_objects', (), {}],
-            ['delete_all_rpsl_objects_with_journal', ('RPKI',), {}],
+            ['delete_all_rpsl_objects_with_journal', ('RPKI',), {'journal_guaranteed_empty': True}],
             ['close', (), {}]
         ]
 
@@ -474,6 +501,45 @@ class MockROADataImporter:
         assert rpki_text == 'roa_data'
         assert slurm_text == 'slurm_data'
         self.roa_objs = ['roa1', 'roa2']
+
+
+class TestScopeFilterUpdateRunner:
+    def test_run(self, monkeypatch, config_override, tmpdir, caplog):
+        mock_dh = Mock(spec=DatabaseHandler)
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.DatabaseHandler', lambda: mock_dh)
+        mock_scopefilter = Mock(spec=ScopeFilterValidator)
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.ScopeFilterValidator', lambda: mock_scopefilter)
+
+        mock_scopefilter.validate_all_rpsl_objects = lambda database_handler: (
+            [{'rpsl_pk': 'pk_now_in_scope1'}, {'rpsl_pk': 'pk_now_in_scope2'}],
+            [{'rpsl_pk': 'pk_now_out_scope_as1'}, {'rpsl_pk': 'pk_now_out_scope_as2'}],
+            [{'rpsl_pk': 'pk_now_out_scope_prefix1'}, {'rpsl_pk': 'pk_now_out_scope_prefix2'}],
+        )
+        ScopeFilterUpdateRunner().run()
+
+        assert flatten_mock_calls(mock_dh) == [
+            ['update_scopefilter_status', (), {
+                'rpsl_objs_now_in_scope': [{'rpsl_pk': 'pk_now_in_scope1'}, {'rpsl_pk': 'pk_now_in_scope2'}],
+                'rpsl_objs_now_out_scope_as': [{'rpsl_pk': 'pk_now_out_scope_as1'}, {'rpsl_pk': 'pk_now_out_scope_as2'}],
+                'rpsl_objs_now_out_scope_prefix': [{'rpsl_pk': 'pk_now_out_scope_prefix1'}, {'rpsl_pk': 'pk_now_out_scope_prefix2'}],
+            }],
+            ['commit', (), {}],
+            ['close', (), {}]
+        ]
+        assert '2 newly in scope, 2 newly out of scope AS, 2 newly out of scope prefix' in caplog.text
+
+    def test_exception_handling(self, monkeypatch, config_override, tmpdir, caplog):
+        mock_dh = Mock(spec=DatabaseHandler)
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.DatabaseHandler', lambda: mock_dh)
+        mock_scopefilter = Mock(side_effect=ValueError('expected-test-error'))
+        monkeypatch.setattr('irrd.mirroring.mirror_runners_import.ScopeFilterValidator', mock_scopefilter)
+
+        ScopeFilterUpdateRunner().run()
+
+        assert flatten_mock_calls(mock_dh) == [
+            ['close', (), {}]
+        ]
+        assert 'expected-test-error' in caplog.text
 
 
 class TestNRTMImportUpdateStreamRunner:

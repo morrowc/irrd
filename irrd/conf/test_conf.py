@@ -60,7 +60,11 @@ class TestConfiguration:
                 'rpki': {
                     'roa_source': None,
                 },
-                'access-lists': {
+                'scopefilter': {
+                    'prefixes': ['10/8'],
+                    'asns': ['23456', '10-20']
+                },
+                'access_lists': {
                     'valid-list': {
                         '192/24',
                         '192.0.2.1',
@@ -171,7 +175,7 @@ class TestConfiguration:
                     'from': 'example@example.com',
                     'smtp': '192.0.2.1'
                 },
-                'access-lists': {
+                'access_lists': {
                     'valid-list': {
                         '192/24',
                         '192.0.2.1',
@@ -214,12 +218,13 @@ class TestConfiguration:
         config = {
             'irrd': {
                 'piddir': str(tmpdir + '/does-not-exist'),
+                'user': 'a',
                 'server': {
                     'whois': {
                         'access_list': 'doesnotexist',
                     },
                     'http': {
-                        'access_list': ['foo'],
+                        'status_access_list': ['foo'],
                     },
                 },
                 'email': {
@@ -237,6 +242,10 @@ class TestConfiguration:
                     'notify_invalid_subject': [],
                     'notify_invalid_header': [],
                 },
+                'scopefilter': {
+                    'prefixes': ['invalid-prefix'],
+                    'asns': ['invalid', '10-invalid'],
+                },
                 'sources_default': ['DOESNOTEXIST-DB'],
                 'sources': {
                     'TESTDB': {
@@ -244,6 +253,7 @@ class TestConfiguration:
                         'import_timer': 'foo',
                         'export_timer': 'bar',
                         'nrtm_host': '192.0.2.1',
+                        'unknown': True,
                     },
                     'TESTDB2': {
                         'authoritative': True,
@@ -262,7 +272,9 @@ class TestConfiguration:
                 'log': {
                     'level': 'INVALID',
                     'logging_config_path': 'path',
-                }
+                    'unknown': True,
+                },
+                'unknown_setting': False,
             }
         }
 
@@ -276,11 +288,14 @@ class TestConfiguration:
         assert 'Setting email.smtp is required.' in str(ce.value)
         assert 'Setting email.footer must be a string, if defined.' in str(ce.value)
         assert 'Setting email.recipient_override must be an email address if set.' in str(ce.value)
+        assert 'Settings user and group must both be defined, or neither.' in str(ce.value)
         assert 'Setting auth.gnupg_keyring is required.' in str(ce.value)
         assert 'Access lists doesnotexist referenced in settings, but not defined.' in str(ce.value)
-        assert 'Setting server.http.access_list must be a string, if defined.' in str(ce.value)
+        assert 'Setting server.http.status_access_list must be a string, if defined.' in str(ce.value)
         assert 'Invalid item in access list bad-list: IPv4 Address with more than 4 bytes.' in str(ce.value)
-        assert 'Setting sources_default contains unknown sources: DOESNOTEXIST-DB' in str(ce.value)
+        assert 'Invalid item in prefix scopefilter: invalid-prefix' in str(ce.value)
+        assert 'Invalid item in asn scopefilter: invalid.' in str(ce.value)
+        assert 'Invalid item in asn scopefilter: 10-invalid.' in str(ce.value)
         assert 'Setting sources contains reserved source name: RPKI' in str(ce.value)
         assert 'Setting keep_journal for source TESTDB can not be enabled unless either ' in str(ce.value)
         assert 'Setting nrtm_host for source TESTDB can not be enabled without setting import_serial_source.' in str(ce.value)
@@ -290,13 +305,17 @@ class TestConfiguration:
         assert 'Setting rpki.roa_import_timer must be set to a number.' in str(ce.value)
         assert 'Setting rpki.notify_invalid_subject must be a string, if defined.' in str(ce.value)
         assert 'Setting rpki.notify_invalid_header must be a string, if defined.' in str(ce.value)
-        assert 'RPKI-aware mode is enabled, but rpki.notify_invalid_enabled' in str(ce.value)
         assert 'Setting import_timer for source TESTDB must be a number.' in str(ce.value)
         assert 'Setting export_timer for source TESTDB must be a number.' in str(ce.value)
         assert 'Invalid source name: lowercase' in str(ce.value)
         assert 'Invalid source name: invalid char' in str(ce.value)
+        assert 'but rpki.notify_invalid_enabled is not set' in str(ce.value)
+        assert 'Setting sources_default contains unknown sources: DOESNOTEXIST-DB' in str(ce.value)
         assert 'Invalid log.level: INVALID' in str(ce.value)
         assert 'Setting log.logging_config_path can not be combined' in str(ce.value)
+        assert 'Unknown setting key: unknown_setting' in str(ce.value)
+        assert 'Unknown setting key: log.unknown' in str(ce.value)
+        assert 'Unknown key(s) under source TESTDB: unknown' in str(ce.value)
 
 
 class TestGetSetting:
@@ -310,3 +329,11 @@ class TestGetSetting:
     def test_get_setting_env(self, monkeypatch):
         monkeypatch.setenv(self.env_name, 'env_value')
         assert get_setting(self.setting_name) == 'env_value'
+
+    def test_get_setting_unknown(self, monkeypatch):
+        with pytest.raises(ValueError):
+            get_setting('unknown')
+        with pytest.raises(ValueError):
+            get_setting('log.unknown')
+        with pytest.raises(ValueError):
+            get_setting('sources.TEST.unknown')

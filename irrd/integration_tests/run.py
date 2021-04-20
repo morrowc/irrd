@@ -1,6 +1,8 @@
 # flake8: noqa: W293
 import sys
 import time
+import unittest
+
 import ujson
 
 import base64
@@ -16,6 +18,8 @@ import yaml
 from alembic import command, config
 from pathlib import Path
 
+from python_graphql_client import GraphqlClient
+
 from irrd.conf import config_init, PASSWORD_HASH_DUMMY_VALUE
 from irrd.utils.rpsl_samples import (SAMPLE_MNTNER, SAMPLE_PERSON, SAMPLE_KEY_CERT, SIGNED_PERSON_UPDATE_VALID,
                                      SAMPLE_AS_SET, SAMPLE_AUT_NUM, SAMPLE_DOMAIN, SAMPLE_FILTER_SET, SAMPLE_INET_RTR,
@@ -24,13 +28,15 @@ from irrd.utils.rpsl_samples import (SAMPLE_MNTNER, SAMPLE_PERSON, SAMPLE_KEY_CE
 from irrd.utils.whois_client import whois_query, whois_query_irrd
 from .constants import (EMAIL_SMTP_PORT, EMAIL_DISCARD_MSGS_COMMAND, EMAIL_RETURN_MSGS_COMMAND, EMAIL_SEPARATOR,
                         EMAIL_END)
+from ..storage import translate_url
 
 IRRD_ROOT_PATH = str(Path(__file__).resolve().parents[2])
 sys.path.append(IRRD_ROOT_PATH)
 
-AS_SET_REFERRING_OTHER_SET = """as-set:         AS-TESTREF
+AS_SET_REFERRING_OTHER_SET = """as-set:         AS65537:AS-TESTREF
 descr:          description
-members:        AS-SETTEST, AS65540
+members:        AS65537:AS-SETTEST, AS65540
+mbrs-by-ref:    TEST-MNT
 tech-c:         PERSON-TEST
 admin-c:        PERSON-TEST
 notify:         notify@example.com
@@ -81,6 +87,7 @@ class TestIntegration:
     port_whois2 = 6044
 
     def test_irrd_integration(self, tmpdir):
+        self.assertCountEqual = unittest.TestCase().assertCountEqual
         # IRRD_DATABASE_URL and IRRD_REDIS_URL override the yaml config, so should be removed
         if 'IRRD_DATABASE_URL' in os.environ:
             del os.environ['IRRD_DATABASE_URL']
@@ -357,14 +364,14 @@ class TestIntegration:
         query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!6AS65537')
         assert query_result == '2001:db8::/48'
         query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!iRS-TEST')
+        assert set(query_result.split(' ')) == {'192.0.2.0/24', '2001:db8::/48', 'RS-OTHER-SET'}
+        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!aAS65537:AS-SETTEST')
         assert set(query_result.split(' ')) == {'192.0.2.0/24', '2001:db8::/48'}
-        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!aAS-SETTEST')
+        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!aAS65537:AS-TESTREF')
         assert set(query_result.split(' ')) == {'192.0.2.0/24', '2001:db8::/48'}
-        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!aAS-TESTREF')
-        assert set(query_result.split(' ')) == {'192.0.2.0/24', '2001:db8::/48'}
-        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!a4AS-TESTREF')
+        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!a4AS65537:AS-TESTREF')
         assert query_result == '192.0.2.0/24'
-        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!a6AS-TESTREF')
+        query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!a6AS65537:AS-TESTREF')
         assert query_result == '2001:db8::/48'
         query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!r192.0.2.0/24')
         assert 'example route' in query_result
@@ -394,10 +401,10 @@ class TestIntegration:
         query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!6AS65537')
         assert query_result == '2001:db8::/48'
         query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!iRS-TEST')
+        assert query_result == '2001:db8::/48 RS-OTHER-SET'
+        query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!aAS65537:AS-SETTEST')
         assert query_result == '2001:db8::/48'
-        query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!aAS-SETTEST')
-        assert query_result == '2001:db8::/48'
-        query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!aAS-TESTREF')
+        query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!aAS65537:AS-TESTREF')
         assert query_result == '2001:db8::/48'
         query_result = whois_query('127.0.0.1', self.port_whois2, '-x 192.0.02.0/24')
         assert 'example route' not in query_result
@@ -409,11 +416,11 @@ class TestIntegration:
 
         # These queries should produce identical answers on both instances.
         for port in self.port_whois1, self.port_whois2:
-            query_result = whois_query_irrd('127.0.0.1', port, '!iAS-SETTEST')
-            assert set(query_result.split(' ')) == {'AS65537', 'AS65538', 'AS65539'}
-            query_result = whois_query_irrd('127.0.0.1', port, '!iAS-TESTREF')
-            assert set(query_result.split(' ')) == {'AS-SETTEST', 'AS65540'}
-            query_result = whois_query_irrd('127.0.0.1', port, '!iAS-TESTREF,1')
+            query_result = whois_query_irrd('127.0.0.1', port, '!iAS65537:AS-SETTEST')
+            assert set(query_result.split(' ')) == {'AS65537', 'AS65538', 'AS65539', 'AS-OTHERSET'}
+            query_result = whois_query_irrd('127.0.0.1', port, '!iAS65537:AS-TESTREF')
+            assert set(query_result.split(' ')) == {'AS65537:AS-SETTEST', 'AS65540'}
+            query_result = whois_query_irrd('127.0.0.1', port, '!iAS65537:AS-TESTREF,1')
             assert set(query_result.split(' ')) == {'AS65537', 'AS65538', 'AS65539', 'AS65540'}
             query_result = whois_query_irrd('127.0.0.1', port, '!maut-num,as65537')
             assert 'AS65537' in query_result
@@ -428,6 +435,7 @@ class TestIntegration:
             query_result = whois_query('127.0.0.1', port, 'dashcare')
             assert 'ROLE-TEST' in query_result
 
+        # Check the mirroring status
         query_result = whois_query_irrd('127.0.0.1', self.port_whois1, '!J-*')
         result = ujson.loads(query_result)
         assert result['TEST']['serial_newest_journal'] == 29
@@ -435,7 +443,7 @@ class TestIntegration:
         assert result['TEST']['serial_newest_mirror'] is None
         # irrd #2 missed the first update from NRTM, as they were done at
         # the same time and loaded from the full export, and one RPKI-invalid object
-        # was not recorded in the journal, so its serial should
+        # was not recorded in the journal, so its local serial should
         # is lower by three
         query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!J-*')
         result = ujson.loads(query_result)
@@ -447,7 +455,7 @@ class TestIntegration:
         with open(self.roa_source2, 'w') as roa_file:
             ujson.dump({'roas': [{'prefix': '198.51.100.0/24', 'asn': 'AS0', 'maxLength': '32', 'ta': 'TA'}]}, roa_file)
 
-        time.sleep(2)
+        time.sleep(3)
         query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!gAS65537')
         assert query_result == '192.0.2.0/24'
         # RPKI invalid object should now be added in the journal
@@ -458,13 +466,15 @@ class TestIntegration:
         result = ujson.loads(query_result)
         assert result['TEST']['serial_newest_journal'] == 27
         assert result['TEST']['serial_last_export'] == 27
+        # This was a local journal update from RPKI status change,
+        # so serial_newest_mirror did not update.
         assert result['TEST']['serial_newest_mirror'] == 29
 
         # Make the v4 route in irrd2 invalid again
         with open(self.roa_source2, 'w') as roa_file:
             ujson.dump({'roas': [{'prefix': '128/1', 'asn': 'AS0', 'maxLength': '32', 'ta': 'TA'}]}, roa_file)
 
-        time.sleep(2)
+        time.sleep(3)
         query_result = whois_query_irrd('127.0.0.1', self.port_whois2, '!gAS65537')
         assert not query_result
         # RPKI invalid object should now be deleted in the journal
@@ -491,6 +501,10 @@ class TestIntegration:
         assert {m['To'] for m in messages} == expected_recipients
         assert '192.0.2.0/24' in mail_text
 
+        self.check_http()
+        self.check_graphql()
+
+    def check_http(self):
         status1 = requests.get(f'http://127.0.0.1:{self.port_http1}/v1/status/')
         status2 = requests.get(f'http://127.0.0.1:{self.port_http2}/v1/status/')
         assert status1.status_code == 200
@@ -503,6 +517,161 @@ class TestIntegration:
         assert 'RPKI' in status2.text
         assert 'Authoritative: Yes' in status1.text
         assert 'Authoritative: Yes' not in status2.text
+
+    def check_graphql(self):
+        client = GraphqlClient(endpoint=f"http://127.0.0.1:{self.port_http1}/graphql/")
+        # Regular rpslObjects query including journal and several references
+        query = """query {
+          rpslObjects(rpslPk: "PERSON-TEST") {
+            rpslPk
+            ... on RPSLContact {
+                mntBy
+            }
+            mntByObjs {
+              rpslPk
+              adminCObjs {
+                ... on RPSLContact {
+                  rpslPk
+                }
+              }
+              adminCObjs {
+                ... on RPSLContact {
+                  rpslPk
+                }
+              }
+            }
+            journal {
+              serialNrtm
+              operation
+              origin
+            }
+          }
+        }
+        """
+        result = client.execute(query=query)
+        assert result['data']['rpslObjects'] == [{
+            'rpslPk': 'PERSON-TEST',
+            'mntBy': ['TEST-MNT'],
+            'mntByObjs': [{'rpslPk': 'TEST-MNT', 'adminCObjs': [{'rpslPk': 'PERSON-TEST'}]}],
+            'journal': [
+                {'serialNrtm': 2, 'operation': 'add_or_update', 'origin': 'auth_change'},
+                {'serialNrtm': 4, 'operation': 'add_or_update', 'origin': 'auth_change'},
+                {'serialNrtm': 5, 'operation': 'delete', 'origin': 'auth_change'},
+                {'serialNrtm': 9, 'operation': 'add_or_update', 'origin': 'auth_change'}
+            ]
+        }]
+
+        # Test memberOfObjs resolving and IP search
+        query = """query {
+          rpslObjects(ipLessSpecificOneLevel: "192.0.2.1" rpkiStatus:[invalid,valid,not_found]) {
+            rpslPk
+            ... on RPSLRoute {
+                memberOfObjs {
+                  rpslPk
+                }
+            }
+          }
+        }
+        """
+        result = client.execute(query=query)
+        self.assertCountEqual(result['data']['rpslObjects'], [
+            {'rpslPk': '192.0.2.0/24AS65537', 'memberOfObjs': [{'rpslPk': 'RS-TEST'}]},
+            {'rpslPk': '192.0.2.0 - 192.0.2.255'}
+        ])
+
+        # Test membersObjs and mbrsByRefObjs resolving
+        query = """query {
+          rpslObjects(rpslPk: ["AS65537:AS-TESTREF", "DOESNOTEXIST"]) {
+            rpslPk
+            ... on RPSLAsSet {
+                membersObjs {
+                  rpslPk
+                }
+                mbrsByRefObjs {
+                  rpslPk
+                }
+            }
+          }
+        }
+        """
+        result = client.execute(query=query)
+        assert result['data']['rpslObjects'] == [{
+            'rpslPk': 'AS65537:AS-TESTREF',
+            'membersObjs': [{'rpslPk': 'AS65537:AS-SETTEST'}],
+            'mbrsByRefObjs': [{'rpslPk': 'TEST-MNT'}],
+        }]
+
+        # Test databaseStatus query
+        query = """query {
+          databaseStatus {
+            source
+            authoritative
+            serialOldestJournal
+            serialNewestJournal
+            serialNewestMirror
+          }
+        }
+        """
+        result = client.execute(query=query)
+        self.assertCountEqual(result['data']['databaseStatus'], [
+            {
+                'source': 'TEST',
+                'authoritative': True,
+                'serialOldestJournal': 1,
+                'serialNewestJournal': 30,
+                'serialNewestMirror': None
+            }, {
+                'source': 'RPKI',
+                'authoritative': False,
+                'serialOldestJournal': None,
+                'serialNewestJournal': None,
+                'serialNewestMirror': None
+            }
+        ])
+
+        # Test asnPrefixes query
+        query = """query {
+          asnPrefixes(asns: [65537]) {
+            asn
+            prefixes
+          }
+        }
+        """
+        result = client.execute(query=query)
+        asnPrefixes = result['data']['asnPrefixes']
+        assert len(asnPrefixes) == 1
+        assert asnPrefixes[0]['asn'] == 65537
+        assert set(asnPrefixes[0]['prefixes']) == {'2001:db8::/48'}
+
+        # Test asSetPrefixes query
+        query = """query {
+          asSetPrefixes(setNames: ["AS65537:AS-TESTREF"]) {
+            rpslPk
+            prefixes
+          }
+        }
+        """
+        result = client.execute(query=query)
+        asSetPrefixes = result['data']['asSetPrefixes']
+        assert len(asSetPrefixes) == 1
+        assert asSetPrefixes[0]['rpslPk'] == 'AS65537:AS-TESTREF'
+        assert set(asSetPrefixes[0]['prefixes']) == {'2001:db8::/48'}
+
+        # Test recursiveSetMembers query
+        query = """query {
+          recursiveSetMembers(setNames: ["AS65537:AS-TESTREF"]) {
+            rpslPk
+            members
+          }
+        }
+        """
+        result = client.execute(query=query)
+        recursiveSetMembers = result['data']['recursiveSetMembers']
+        assert len(recursiveSetMembers) == 1
+        assert recursiveSetMembers[0]['rpslPk'] == 'AS65537:AS-TESTREF'
+        assert set(recursiveSetMembers[0]['members']) == {
+            'AS65537', 'AS65538', 'AS65539', 'AS65540'
+        }
 
     def _start_mailserver(self):
         """
@@ -575,7 +744,7 @@ class TestIntegration:
 
                 'server': {
                     'http': {
-                        'access_list': 'localhost',
+                        'status_access_list': 'localhost',
                         'interface': '::1',
                         'port': 8080
                     },
@@ -670,20 +839,22 @@ class TestIntegration:
         alembic_cfg.set_main_option('script_location', f'{IRRD_ROOT_PATH}/irrd/storage/alembic')
         command.upgrade(alembic_cfg, 'head')
 
-        connection = sa.create_engine(self.database_url1).connect()
+        connection = sa.create_engine(translate_url(self.database_url1)).connect()
         connection.execute('DELETE FROM rpsl_objects')
         connection.execute('DELETE FROM rpsl_database_journal')
         connection.execute('DELETE FROM database_status')
+        connection.execute('DELETE FROM roa_object')
 
         config_init(self.config_path2)
         alembic_cfg = config.Config()
         alembic_cfg.set_main_option('script_location', f'{IRRD_ROOT_PATH}/irrd/storage/alembic')
         command.upgrade(alembic_cfg, 'head')
 
-        connection = sa.create_engine(self.database_url2).connect()
+        connection = sa.create_engine(translate_url(self.database_url2)).connect()
         connection.execute('DELETE FROM rpsl_objects')
         connection.execute('DELETE FROM rpsl_database_journal')
         connection.execute('DELETE FROM database_status')
+        connection.execute('DELETE FROM roa_object')
 
     def _submit_update(self, config_path, request):
         """
@@ -790,4 +961,3 @@ class TestIntegration:
             except (FileNotFoundError, ProcessLookupError, ValueError) as exc:
                 print(f'Failed to kill: {pidfile}: {exc}')
                 pass
-

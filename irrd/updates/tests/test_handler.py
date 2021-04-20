@@ -1,14 +1,16 @@
 # flake8: noqa: W293
-import datetime
 import textwrap
 from unittest.mock import Mock
 
 import pytest
 
+from irrd.scopefilter.status import ScopeFilterStatus
+from irrd.scopefilter.validators import ScopeFilterValidator
+from irrd.storage.models import JournalEntryOrigin
 from irrd.utils.rpsl_samples import SAMPLE_MNTNER
 from irrd.utils.test_utils import flatten_mock_calls
 from ..handler import ChangeSubmissionHandler
-from ...storage.models import JournalEntryOrigin
+from ...utils.validators import RPSLChangeSubmission
 
 
 @pytest.fixture()
@@ -23,13 +25,17 @@ def prepare_mocks(monkeypatch, config_override):
     mock_email = Mock()
     monkeypatch.setattr('irrd.utils.email.send_email', mock_email)
     config_override({'auth': {'override_password': '$1$J6KycItM$MbPaBU6iFSGFV299Rk7Di0'}})
+
+    mock_scopefilter = Mock(spec=ScopeFilterValidator)
+    monkeypatch.setattr('irrd.updates.parser.ScopeFilterValidator',
+                        lambda: mock_scopefilter)
+    mock_scopefilter.validate_rpsl_object = lambda obj: (ScopeFilterStatus.in_scope, '')
     yield mock_dq, mock_dh, mock_email
 
 
 class TestChangeSubmissionHandler:
     # NOTE: the scope of this test also includes ChangeRequest, ReferenceValidator and AuthValidator -
     # this is more of an update handler integration test.
-    expected_changed_date = datetime.datetime.now().strftime('%Y%m%d')
 
     def test_parse_valid_new_objects_with_override(self, prepare_mocks):
         mock_dq, mock_dh, mock_email = prepare_mocks
@@ -70,7 +76,7 @@ class TestChangeSubmissionHandler:
         remarks:        remark
         """)
 
-        handler = ChangeSubmissionHandler(rpsl_text)
+        handler = ChangeSubmissionHandler().load_text_blob(rpsl_text)
         assert handler.status() == 'SUCCESS'
 
         assert flatten_mock_calls(mock_dq) == [
@@ -89,7 +95,7 @@ class TestChangeSubmissionHandler:
         assert mock_dh.mock_calls[3][0] == 'commit'
         assert mock_dh.mock_calls[4][0] == 'close'
 
-        assert handler.submitter_report() == textwrap.dedent("""
+        assert handler.submitter_report_human() == textwrap.dedent("""
         SUMMARY OF UPDATE:
 
         Number of objects found:                    3
@@ -167,9 +173,12 @@ class TestChangeSubmissionHandler:
         ])
         mock_dh.execute_query = lambda query: next(query_responses)
 
-        handler = ChangeSubmissionHandler(rpsl_text, pgp_fingerprint='8626 1D8DBEBD A4F5 4692  D64D A838 3BA7 80F2 38C6',
-                                          request_meta={'Message-ID': 'test', 'From': 'example@example.com'})
-        assert handler.status() == 'SUCCESS', handler.submitter_report()
+        handler = ChangeSubmissionHandler().load_text_blob(
+            rpsl_text,
+            pgp_fingerprint='8626 1D8DBEBD A4F5 4692  D64D A838 3BA7 80F2 38C6',
+            request_meta={'Message-ID': 'test', 'From': 'example@example.com'}
+        )
+        assert handler.status() == 'SUCCESS', handler.submitter_report_human()
 
         assert flatten_mock_calls(mock_dq) == [
             ['object_classes', (['key-cert'],), {}], ['rpsl_pk', ('PGPKEY-80F238C6',), {}],
@@ -185,7 +194,7 @@ class TestChangeSubmissionHandler:
         assert mock_dh.mock_calls[2][0] == 'commit'
         assert mock_dh.mock_calls[3][0] == 'close'
 
-        assert handler.submitter_report() == textwrap.dedent(f"""
+        assert handler.submitter_report_human() == textwrap.dedent(f"""
         > Message-ID: test
         > From: example@example.com
         
@@ -207,18 +216,7 @@ class TestChangeSubmissionHandler:
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         ---
         Create succeeded: [person] PERSON-TEST
-        
-        person:         Placeholder Person Object
-        address:        The Netherlands
-        phone:          +31 20 000 0000
-        nic-hdl:        PERSON-TEST
-        mnt-by:         TEST-MNT
-        e-mail:         email@example.com
-        changed:        changed@example.com {self.expected_changed_date} # comment
-        source:         TEST
-        
-        INFO: Set date in changed line "changed@example.com 20190701 # comment" to today.
-        
+                
         ---
         Modify succeeded: [mntner] TEST-MNT
 
@@ -230,9 +228,10 @@ class TestChangeSubmissionHandler:
             or object authorisation failures.
             
             You may receive this message because you are listed in
-            the notify attribute on the changed object(s), or because
+            the notify attribute on the changed object(s), because
             you are listed in the mnt-nfy or upd-to attribute on a maintainer
-            of the object(s).
+            of the object(s), or the upd-to attribute on the maintainer of a
+            parent of newly created object(s).
             
             This message is auto-generated.
             The request was made by email, with the following details:
@@ -254,7 +253,7 @@ class TestChangeSubmissionHandler:
             nic-hdl:        PERSON-TEST
             mnt-by:         TEST-MNT
             e-mail:         email@example.com
-            changed:        changed@example.com {self.expected_changed_date} # comment
+            changed:        changed@example.com 20190701 # comment
             source:         TEST
             
             ---
@@ -316,8 +315,8 @@ class TestChangeSubmissionHandler:
         ])
         mock_dh.execute_query = lambda query: next(query_responses)
 
-        handler = ChangeSubmissionHandler(rpsl_text, pgp_fingerprint='8626 1D8DBEBD A4F5 4692  D64D A838 3BA7 80F2 38C6')
-        assert handler.status() == 'FAILED', handler.submitter_report()
+        handler = ChangeSubmissionHandler().load_text_blob(rpsl_text, pgp_fingerprint='8626 1D8DBEBD A4F5 4692  D64D A838 3BA7 80F2 38C6')
+        assert handler.status() == 'FAILED', handler.submitter_report_human()
 
         assert flatten_mock_calls(mock_dq) == [
             ['object_classes', (['key-cert'],), {}], ['rpsl_pk', ('PGPKEY-80F238C6',), {}],
@@ -351,7 +350,7 @@ class TestChangeSubmissionHandler:
         ])
         mock_dh.execute_query = lambda query: next(query_responses)
 
-        handler = ChangeSubmissionHandler(rpsl_person + 'delete: delete\npassword: crypt-password\n')
+        handler = ChangeSubmissionHandler().load_text_blob(rpsl_person + 'delete: delete\npassword: crypt-password\n')
         assert handler.status() == 'SUCCESS'
 
         assert flatten_mock_calls(mock_dq) == [
@@ -367,7 +366,7 @@ class TestChangeSubmissionHandler:
         assert mock_dh.mock_calls[1][0] == 'commit'
         assert mock_dh.mock_calls[2][0] == 'close'
 
-        assert handler.submitter_report() == textwrap.dedent("""
+        assert handler.submitter_report_human() == textwrap.dedent("""
             SUMMARY OF UPDATE:
 
             Number of objects found:                    1
@@ -389,14 +388,59 @@ class TestChangeSubmissionHandler:
             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         """)
 
+        assert handler.submitter_report_json() == {
+            'request_meta': {},
+            'summary': {
+                'failed': 0,
+                'failed_create': 0,
+                'failed_delete': 0,
+                'failed_modify': 0,
+                'objects_found': 1,
+                'successful': 1,
+                'successful_create': 0,
+                'successful_delete': 1,
+                'successful_modify': 0
+            },
+            'objects': [{
+                'successful': True,
+                'type': 'delete',
+                'error_messages': [],
+                'object_class': 'person',
+                'rpsl_pk': 'PERSON-TEST',
+                'info_messages': [],
+                'new_object_text': 'person:         Placeholder Person Object\n'
+                                   'address:        The Netherlands\n'
+                                   'phone:          +31 20 00000000\n'
+                                   'nic-hdl:        PERSON-TEST\n'
+                                   'mnt-by:         TEST-MNT\n'
+                                   'e-mail:         email@example.com\n'
+                                   'notify:         notify@example.com\n'
+                                   'changed:        changed@example.com 20190701 '
+                                   '# comment\n'
+                                   'source:         TEST\n',
+                'submitted_object_text': 'person:         Placeholder Person '
+                                         'Object\n'
+                                         'address:        The Netherlands\n'
+                                         'phone:          +31 20 00000000\n'
+                                         'nic-hdl:        PERSON-TEST\n'
+                                         'mnt-by:         TEST-MNT\n'
+                                         'e-mail:         email@example.com\n'
+                                         'notify:         notify@example.com\n'
+                                         'changed:        changed@example.com '
+                                         '20190701 # comment\n'
+                                         'source:         TEST\n',
+            }]
+        }
+
         expected_notification = textwrap.dedent("""
             This is to notify you of changes in the TEST database
             or object authorisation failures.
             
             You may receive this message because you are listed in
-            the notify attribute on the changed object(s), or because
+            the notify attribute on the changed object(s), because
             you are listed in the mnt-nfy or upd-to attribute on a maintainer
-            of the object(s).
+            of the object(s), or the upd-to attribute on the maintainer of a
+            parent of newly created object(s).
             
             This message is auto-generated.
             The request was made by email, with the following details:
@@ -470,7 +514,7 @@ class TestChangeSubmissionHandler:
         source:         TEST
         """)
 
-        handler = ChangeSubmissionHandler(rpsl_text)
+        handler = ChangeSubmissionHandler().load_text_blob(rpsl_text)
         assert handler.status() == 'FAILED'
 
         assert flatten_mock_calls(mock_dq) == [
@@ -488,7 +532,7 @@ class TestChangeSubmissionHandler:
             ['close', (), {}],
         ]
 
-        assert handler.submitter_report() == textwrap.dedent("""
+        assert handler.submitter_report_human() == textwrap.dedent("""
         SUMMARY OF UPDATE:
         
         Number of objects found:                    3
@@ -555,6 +599,97 @@ class TestChangeSubmissionHandler:
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         """)
 
+        assert handler.submitter_report_json() == {
+            'request_meta': {},
+            'summary': {
+                'failed': 3,
+                'failed_create': 3,
+                'failed_delete': 0,
+                'failed_modify': 0,
+                'objects_found': 3,
+                'successful': 0,
+                'successful_create': 0,
+                'successful_delete': 0,
+                'successful_modify': 0,
+            },
+            'objects': [
+                {
+                    'successful': False,
+                    'type': 'create',
+                    'object_class': 'mntner',
+                    'rpsl_pk': 'TEST-MNT',
+                    'error_messages': ['Object PERSON-TEST referenced in field '
+                                       'admin-c not found in database TEST - must '
+                                       'reference one of role, person.'],
+                    'info_messages': [],
+                    'new_object_text': None,
+                    'submitted_object_text': 'mntner:         TEST-MNT\n'
+                                             'admin-c:        PERSON-TEST\n'
+                                             'upd-to:         unread@ripe.net\n'
+                                             'auth:           PGPKey-80F238C6\n'
+                                             'auth:           MD5-pw '
+                                             '$1$fgW84Y9r$kKEn9MUq8PChNKpQhO6BM.  # '
+                                             'md5-password\n'
+                                             'mnt-by:         TEST-MNT\n'
+                                             'changed:        changed@example.com '
+                                             '20190701 # comment\n'
+                                             'source:         TEST\n',
+                }, {
+                    'successful': False,
+                    'type': 'create',
+                    'object_class': 'inetnum',
+                    'rpsl_pk': '80.16.151.184 - 80.16.151.191',
+                    'error_messages': ['Object PERSON-TEST referenced in field '
+                                       'admin-c not found in database TEST - must '
+                                       'reference one of role, person.',
+                                       'Object PERSON-TEST referenced in field '
+                                       'tech-c not found in database TEST - must '
+                                       'reference one of role, person.'],
+                    'info_messages': ['Address range 80.16.151.184 - 80.016.151.191 '
+                                      'was reformatted as 80.16.151.184 - '
+                                      '80.16.151.191'],
+                    'new_object_text': None,
+                    'submitted_object_text': 'inetnum:        80.16.151.184 - '
+                                             '80.016.151.191\n'
+                                             'netname:        NETECONOMY-MG41731\n'
+                                             'descr:          TELECOM ITALIA LAB '
+                                             'SPA\n'
+                                             'country:        IT\n'
+                                             'admin-c:        PERSON-TEST\n'
+                                             'tech-c:         PERSON-TEST\n'
+                                             'status:         ASSIGNED PA\n'
+                                             'notify:         '
+                                             'neteconomy.rete@telecomitalia.it\n'
+                                             'mnt-by:         TEST-MNT\n'
+                                             'changed:        changed@example.com '
+                                             '20190701 # comment\n'
+                                             'source:         TEST\n'
+                                             'remarks:        remark\n',
+                },
+                {
+                    'successful': False,
+                    'type': 'create',
+                    'object_class': 'person',
+                    'rpsl_pk': 'PERSON-TEST',
+                    'error_messages': ['Object OTHER-MNT referenced in field mnt-by '
+                                       'not found in database TEST - must reference '
+                                       'mntner.'],
+                    'info_messages': [],
+                    'new_object_text': None,
+                    'submitted_object_text': 'person:         Placeholder Person '
+                                             'Object\n'
+                                             'address:        The Netherlands\n'
+                                             'phone:          +31 20 000 0000\n'
+                                             'nic-hdl:        PERSON-TEST\n'
+                                             'mnt-by:         OTHER-MNT\n'
+                                             'e-mail:         email@example.com\n'
+                                             'changed:        changed@example.com '
+                                             '20190701 # comment\n'
+                                             'source:         TEST\n',
+                }
+            ],
+        }
+
     def test_parse_invalid_single_failure_invalid_password(self, prepare_mocks):
         mock_dq, mock_dh, mock_email = prepare_mocks
         query_results = iter([
@@ -572,9 +707,16 @@ class TestChangeSubmissionHandler:
         e-mail:         email@example.com
         changed:        changed@example.com 20190701 # comment
         source:         TEST
-        """)
+        """).strip() + '\n'
 
-        handler = ChangeSubmissionHandler(rpsl_text)
+        submission_object = RPSLChangeSubmission.parse_obj({
+            'objects': [
+                {'object_text': rpsl_text},
+            ],
+            'passwords': ['invalid1', 'invalid2'],
+        })
+
+        handler = ChangeSubmissionHandler().load_change_submission(submission_object)
         assert handler.status() == 'FAILED'
 
         assert flatten_mock_calls(mock_dq) == [
@@ -586,7 +728,7 @@ class TestChangeSubmissionHandler:
             ['close', (), {}],
         ]
 
-        assert handler.submitter_report() == textwrap.dedent("""
+        assert handler.submitter_report_human() == textwrap.dedent("""
             SUMMARY OF UPDATE:
             
             Number of objects found:                    1
@@ -624,9 +766,10 @@ class TestChangeSubmissionHandler:
             or object authorisation failures.
             
             You may receive this message because you are listed in
-            the notify attribute on the changed object(s), or because
+            the notify attribute on the changed object(s), because
             you are listed in the mnt-nfy or upd-to attribute on a maintainer
-            of the object(s).
+            of the object(s), or the upd-to attribute on the maintainer of a
+            parent of newly created object(s).
             
             This message is auto-generated.
             The request was made by email, with the following details:
@@ -705,7 +848,7 @@ class TestChangeSubmissionHandler:
         remarks:        remark
         """)
 
-        handler = ChangeSubmissionHandler(rpsl_text)
+        handler = ChangeSubmissionHandler().load_text_blob(rpsl_text)
         assert handler.status() == 'FAILED'
 
         assert flatten_mock_calls(mock_dq) == [
@@ -722,7 +865,7 @@ class TestChangeSubmissionHandler:
             ['close', (), {}],
         ]
 
-        assert handler.submitter_report() == textwrap.dedent("""
+        assert handler.submitter_report_human() == textwrap.dedent("""
         SUMMARY OF UPDATE:
 
         Number of objects found:                    3
@@ -790,25 +933,30 @@ class TestChangeSubmissionHandler:
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         """)
 
-    def test_parse_invalid_object_syntax(self, prepare_mocks):
+    def test_parse_invalid_object_delete_syntax(self, prepare_mocks):
         mock_dq, mock_dh, mock_email = prepare_mocks
         mock_dh.execute_query = lambda query: []
 
-        rpsl_text = textwrap.dedent("""
-        person:         Placeholder Person Object
-        nic-hdl:        PERSON-TEST
-        changed:        changed@example.com 20190701 # comment
-        source:         TEST
-        """)
+        submission_object = RPSLChangeSubmission.parse_obj({
+            'objects': [
+                {'attributes': [
+                    {'name': 'person', 'value': 'Placeholder Person Object'},
+                    {'name': 'nic-hdl', 'value': 'PERSON-TEST'},
+                    {'name': 'changed', 'value': 'changed@example.com 20190701 # comment'},
+                    {'name': 'source', 'value': 'TEST'},
+                ]},
+            ],
+            'passwords': ['invalid1', 'invalid2'],
+        })
 
-        handler = ChangeSubmissionHandler(rpsl_text)
+        handler = ChangeSubmissionHandler().load_change_submission(submission_object, delete=True)
         assert handler.status() == 'FAILED'
 
         assert flatten_mock_calls(mock_dq) == []
         assert mock_dh.mock_calls[0][0] == 'commit'
         assert mock_dh.mock_calls[1][0] == 'close'
 
-        assert handler.submitter_report() == textwrap.dedent("""
+        assert handler.submitter_report_human() == textwrap.dedent("""
         SUMMARY OF UPDATE:
         
         Number of objects found:                    1
@@ -819,23 +967,24 @@ class TestChangeSubmissionHandler:
         Number of objects processed with errors:    1
             Create:        0
             Modify:        0
-            Delete:        0
+            Delete:        1
         
         DETAILED EXPLANATION:
         
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         ---
-        Request FAILED: [person] PERSON-TEST
+        Delete FAILED: [person] PERSON-TEST
         
-        person:         Placeholder Person Object
-        nic-hdl:        PERSON-TEST
-        changed:        changed@example.com 20190701 # comment
-        source:         TEST
+        person: Placeholder Person Object
+        nic-hdl: PERSON-TEST
+        changed: changed@example.com 20190701 # comment
+        source: TEST
         
         ERROR: Mandatory attribute "address" on object person is missing
         ERROR: Mandatory attribute "phone" on object person is missing
         ERROR: Mandatory attribute "e-mail" on object person is missing
         ERROR: Mandatory attribute "mnt-by" on object person is missing
-        
+        ERROR: Can not delete object: no object found for this key in this database.
+ 
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         """)

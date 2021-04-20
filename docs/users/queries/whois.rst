@@ -1,16 +1,30 @@
-=====================
-Running whois queries
-=====================
+=============
+Whois queries
+=============
 
-IRRd accepts whois queries on port 43 (by default).
-The encoding used is always UTF-8, though many objects fit 7-bit ASCII.
-Line separators are a single newline (``\n``) character.
+IRRd accepts whois queries in two ways:
 
-.. note::
-   Due to caching in IRRd, it can take up to 60 seconds for some types
-   of changes to be visible in the result of some queries.
+* Raw TCP sockets on (by default) port 43
+* HTTPS requests
 
-.. contents:: :backlinks: none
+
+Making queries
+--------------
+HTTPS
+^^^^^
+To make whois queries over HTTPS, make a GET request to ``/v1/whois/``
+with your query in the ``q`` parameter. For example, if the IRRd instance
+is running on ``rr.example.net``, you can query ``!iAS-DEMO`` on::
+
+    https://rr.example.net/v1/whois/?q=!iAS-DEMO
+
+For some queries you may need to do URL encoding of the whois query,
+but many libraries can do that for you if needed.
+
+Raw TCP sockets
+^^^^^^^^^^^^^^^
+To query over raw TCP sockets, make a TCP connection to port 43 (by default)
+and submit your query, ending with a single newline (``\n``).
 
 IRRd vs RIPE style
 ------------------
@@ -18,22 +32,25 @@ IRRd supports two styles of queries:
 
 * IRRd style queries, many of which return processed data
   rather than raw RPSL object text. For example,
-  ``!iRS-EXAMPLE,1`` finds all members of route-set `RS-EXAMPLE`,
-  recursively and returns them as a space-separated list of prefixes.
+  ``!iRS-EXAMPLE,1`` recursively finds all members of route-set `RS-EXAMPLE`,
+  and returns them as a space-separated list of prefixes.
 * RIPE style queries, which you may know from the RIPE whois database and many
   similar implementations. For example, ``-s APNIC -M 192.0.2/21`` finds
   all more specific objects of 192.0.2/21 from source APNIC.
 
 The two styles can not be combined in a single query, but can be mixed in
-a single connection.
+a single TCP connection.
 
 IRRd style queries
 ------------------
-* ``!!`` activates multiple command mode. The connection will be kept open
-  after a query has been sent. Queries are answered in the order they were
-  submitted. Takes no parameters. In deviation from all other queries,
-  this query will return no response at all.
-* ``!t<timeout>`` sets the timeout of the connection. The connection is closed when no activity on the connection has occurred for this many seconds and there are neither running queries nor queries in the pipeline. Valid values range from 1 to 1000. The default is 30 seconds.
+* ``!!`` activates multiple command mode for raw TCP sockets. The connection
+  will be kept open after a query has been sent. Queries are answered in the
+  order they were submitted. Takes no parameters. In deviation from all other
+  queries, this query will return no response at all.
+* ``!t<timeout>`` sets the timeout for a raw TCP connection.
+  The connection is closed when no activity on the connection has occurred for
+  this many seconds and there are neither running queries nor queries in the
+  pipeline. Valid values range from 1 to 1000. The default is 30 seconds.
 * ``!a<as-set-name>`` recursively resolves an `as-set`, then resolves all
   combined unique prefixes originating from any of the ASes in the set. Returns
   both IPv4 and IPv6 prefixes. Can be filtered to either IPv4 or IPv6 with
@@ -80,7 +97,7 @@ IRRd style queries
     is mirrored from elsewhere.
   * ``object_class_filter``: may be a list of object classes that are
     ignored by this IRRd instance, when mirroring from a remote source.
-  * ``rpki_enabled``: whether RPKI validation is enabled for this source.
+  * ``rpki_rov_filter``: whether RPKI validation is enabled for this source.
   * ``local_journal_kept``: whether this IRRd instance keeps a local journal
     of the changes in this source, allowing it to be mirrored over NRTM.
   * ``serial_oldest_journal`` / ``serial_newest_journal``: the oldest and
@@ -98,6 +115,8 @@ IRRd style queries
   * ``last_update``: the time of the last change to this source. This may be
     an authoritative change, an update from a mirror, a re-import, a change
     in the RPKI status of an object, or something else.
+  * ``synchronised_serials``: whether or not a mirrored source is running with
+    :ref:`synchronised serials <mirroring-nrtm-serials>`.
 * ``!m<object-class>,<primary-key>`` searches for objects exactly matching
   the primary key, of the specified RPSL object class. For example:
   ``!maut-num,AS23456``. Stops at the first object. The key is case
@@ -125,36 +144,17 @@ IRRd style queries
 * ``!v`` returns the current version of IRRd
 * ``!fno-rpki-filter`` disables filtering RPKI invalid routes. If
   :doc:`RPKI-aware mode is enabled </admins/rpki>`, `route(6)` objects that
-  conflict with RPKI ROAs are not included in the output of any query by default.
+  are RPKI invalid are not included in the output of any query by default.
   After using ``!fno-rpki-filter``, this filter is disabled for the remainder of
   the connection. Disabling the filter only applies to ``!r`` queries and
   all RIPE style queries. This is only intended as a debugging aid.
+* ``!fno-scope-filter`` disables filtering out-of-scope objects. If
+  the scope filter is enabled, objects that are
+  :doc:`out of scope </admins/scopefilter>` are not included in the output of any query by default.
+  After using ``!fno-scope-filter``, this filter is disabled for the remainder of
+  the connection. Disabling the filter only applies to ``!r`` queries and
+  all RIPE style queries. This is only intended as a debugging aid.
 
-Responses
-^^^^^^^^^
-For a successful response returning data, the response is::
-
-    A<length>
-    <response content>
-    C
-
-The length is the number of bytes in the response, including the newline
-immediately after the response content. Different objects are part of one
-lock of response content, each object separated by a blank line.
-
-If the query was valid, but no entries were found, the response is::
-
-    C
-
-If the query was valid, but the primary key queried for did not exist::
-
-    D
-
-If the query was invalid::
-
-    F <error message>
-
-A ``!!`` query will not return any response.
 
 RIPE style queries
 ------------------
@@ -173,11 +173,8 @@ The query::
 will set the client name to `my-client` and return all as-sets named
 `AS-EXAMPLE`.
 
-RIPE style queries always end with two empty lines, i.e.
-two newline characters.
+The queries are:
 
-Queries
-^^^^^^^
 * ``-l``, ``-L``, ``-M`` and ``-x`` search for `route` or `route6` objects.
   The differences are:
 
@@ -211,7 +208,8 @@ Queries
 
 Supported flags
 ^^^^^^^^^^^^^^^
-* ``-k`` activates keepalive mode. The connection will be kept open
+
+* ``-k`` activates keepalive mode on TCP. The connection will be kept open
   after a query has been sent. Queries are answered in the order they were
   submitted.
 * ``-s <sources>`` and ``-a`` set the sources used for queries. ``-s``
@@ -228,13 +226,74 @@ Supported flags
 Flags are placed before the query, i.e. ``-s`` should precede ``-x``.
 
 The ``-F`` and ``-r`` flags are accepted but ignored, as IRRd does not support
-recursion.
+recursion on whois.
 
-Responses
-^^^^^^^^^
+
+Query responses
+---------------
+
+The response format differs for HTTPS and raw TCP queries, and also per
+query style for raw TCP queries.
+
+HTTPS responses
+^^^^^^^^^^^^^^^
+
+HTTPS queries have four possible responses:
+
+* If the query produced a result, the response content with status
+  code 200.
+* If the query did not produce a result, but was valid, an empty
+  response with status code 204.
+* If the query was invalid or missing, an error message with
+  status code 400.
+* If IRRd encountered an internal error while processing, a generic
+  error message with status code 500.
+
+.. tip::
+   If you are experimenting with the API in a browser, note that some
+   browsers handle a 204 response by keeping the previous content and
+   URL visible - even though they are not the output of your latest
+   query. Most browsers will have a network inspection console that
+   shows the details of each HTTPS request.
+
+Raw TCP responses
+^^^^^^^^^^^^^^^^^
+The character encoding is always UTF-8, though many objects fit 7-bit ASCII.
+Line separators are a single newline (``\n``) character.
+
+IRRd style TCP responses
+""""""""""""""""""""""""
+For a successful response returning data, the response is::
+
+    A<length>
+    <response content>
+    C
+
+The length is the number of bytes in the response, including the newline
+immediately after the response content. Different objects are part of one
+lock of response content, each object separated by a blank line.
+
+If the query was valid, but no entries were found, the response is::
+
+    C
+
+If the query was valid, but the primary key queried for did not exist::
+
+    D
+
+If the query was invalid::
+
+    F <error message>
+
+A ``!!`` query will not return any response.
+
+
+RIPE style TCP responses
+""""""""""""""""""""""""
 For a successful response returning data, the response is simply the object
 data, with different objects separated by a blank line, followed by an
-extra newline.
+extra newline. RIPE style queries always end with two empty lines, i.e.
+two newline characters.
 
 If the query was valid, but no entries were found, the response is::
 
@@ -254,17 +313,3 @@ the first object with a given primary key, from the highest priority source
 in which it was found.
 
 The currently enabled sources and their priority can be seen with ``!s-lc``.
-
-Data preloading and warm-up time
---------------------------------
-After startup, IRRd needs some time before certain queries can be answered.
-The ``!g``, ``!6``, ``!a`` and in some cases ``!i`` queries use preloaded
-data, which needs to be loaded before these queries can be answered.
-If these queries are used before the preloading is complete, IRRd will
-answer them after preloading has completed. The time this takes depends
-on the load and speed of the server on which IRRd is deployed, and can
-range between several seconds and one minute.
-
-Once the initial preload is complete, updates to the database do not cause
-delays in queries. However, they may cause queries to return responses
-based on slightly outdated data, typically 5-15 seconds.

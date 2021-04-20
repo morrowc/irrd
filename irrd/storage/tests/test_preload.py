@@ -1,16 +1,18 @@
-import time
-
-import pytest
 import threading
+import time
 from unittest.mock import Mock
 
+import pytest
+
 from irrd.rpki.status import RPKIStatus
+from irrd.scopefilter.status import ScopeFilterStatus
 from irrd.utils.test_utils import flatten_mock_calls
 from ..database_handler import DatabaseHandler
-from ..preload import Preloader, PreloadStoreManager, PreloadUpdater, REDIS_KEY_ORIGIN_SOURCE_SEPARATOR
+from ..preload import (Preloader, PreloadStoreManager, PreloadUpdater,
+                       REDIS_KEY_ORIGIN_SOURCE_SEPARATOR)
 from ..queries import RPSLDatabaseQuery
 
-# Use different
+# Use different stores in tests
 TEST_REDIS_ORIGIN_ROUTE4_STORE_KEY = 'TEST-irrd-preload-origin-route4'
 TEST_REDIS_ORIGIN_ROUTE6_STORE_KEY = 'TEST-irrd-preload-origin-route6'
 TEST_REDIS_PRELOAD_RELOAD_CHANNEL = 'TEST-irrd-preload-reload-channel'
@@ -36,9 +38,8 @@ class TestPreloading:
     def test_load_reload_thread_management(self, mock_preload_updater, mock_redis_keys):
         preload_manager = PreloadStoreManager()
 
-        preload_manager_thread = threading.Thread(target=preload_manager.main)
+        preload_manager_thread = threading.Thread(target=preload_manager.main, daemon=True)
         preload_manager_thread.start()
-
         time.sleep(1)
         assert mock_preload_updater.mock_calls[0][0] == ''
         assert mock_preload_updater.mock_calls[0][1][0] == preload_manager
@@ -75,6 +76,7 @@ class TestPreloading:
         Preloader().signal_reload({'inetnum'})
         Preloader().signal_reload()
         Preloader().signal_reload()
+        time.sleep(0.5)
 
         # As all threads are considered dead, a new thread should be started
         assert mock_preload_updater.mock_calls[0][0] == ''
@@ -88,6 +90,9 @@ class TestPreloading:
         preloader = Preloader()
         preload_manager = PreloadStoreManager()
 
+        # Wait for the preloader instance to start listening on pubsub
+        time.sleep(1)
+
         preload_manager.update_route_store(
             {
                 f'TEST2{REDIS_KEY_ORIGIN_SOURCE_SEPARATOR}AS65546': {'192.0.2.0/25'},
@@ -97,6 +102,7 @@ class TestPreloading:
                 f'TEST2{REDIS_KEY_ORIGIN_SOURCE_SEPARATOR}AS65547': {'2001:db8::/32'},
             },
         )
+
         sources = ['TEST1', 'TEST2']
         assert preloader.routes_for_origins([], sources) == set()
         assert preloader.routes_for_origins(['AS65545'], sources) == set()
@@ -163,6 +169,7 @@ class TestPreloadUpdater:
         assert flatten_mock_calls(mock_database_query) == [
             ['object_classes', (['route', 'route6'],), {}],
             ['rpki_status', ([RPKIStatus.not_found, RPKIStatus.valid],), {}],
+            ['scopefilter_status', ([ScopeFilterStatus.in_scope],), {}],
         ]
 
         assert flatten_mock_calls(mock_preload_obj) == [

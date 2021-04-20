@@ -9,7 +9,9 @@ Configuration
 IRRd reads its configuration from a YAML file in a specified location. Many
 configuration options can be changed without restarting IRRd, but not all.
 
-.. contents:: :backlinks: none
+.. contents::
+   :backlinks: none
+   :local:
 
 Example configuration file
 --------------------------
@@ -23,6 +25,8 @@ This sample shows most configuration options::
         database_url: 'postgresql:///irrd'
         redis_url: 'unix:///usr/local/var/run/redis.sock'
         piddir: /var/run/
+        user: irrd
+        group: irrd
 
         access_lists:
             http_database_status:
@@ -34,7 +38,7 @@ This sample shows most configuration options::
 
         server:
             http:
-                access_list: http_database_status
+                status_access_list: http_database_status
                 interface: '::0'
                 port: 8080
             whois:
@@ -71,6 +75,12 @@ This sample shows most configuration options::
                 from the RPKI. This route object is the result of an automated
                 RPKI-to-IRR conversion process performed by IRRd.
 
+        scopefilter:
+            prefixes:
+                - 10.0.0.0/8
+            asns:
+                - 23456
+                - 64496-64511
         sources_default:
             - AUTHDATABASE
             - MIRROR-SECOND
@@ -134,6 +144,8 @@ If a `SIGHUP` is sent and the new configuration is invalid, errors will be
 written to the logfile, but IRRd will keep running with the last valid
 configuration. A successful reload after a `SIGHUP` is also logged.
 
+IRRd will reject unknown configuration options, and fail to start or reload.
+
 .. important::
 
     Not all configuration errors are caught when reloading, such as making IRRd
@@ -151,8 +163,8 @@ configuration. A successful reload after a `SIGHUP` is also logged.
 Configuration options
 ---------------------
 
-Storage
-~~~~~~~
+General settings
+~~~~~~~~~~~~~~~~
 * ``database_url``: a RFC1738 PostgreSQL database URL for the database used by
   IRRd, e.g. ``postgresql://username:password@localhost:5432/irrd`` to connect
   to `localhost` on port 5432, database `irrd`, username `username`,
@@ -173,31 +185,60 @@ Storage
   be written (as ``irrd.pid``).
   |br| **Default**: not defined, but required.
   |br| **Change takes effect**: after full IRRd restart.
+* ``user`` and ``group``: the user and group name to which IRRd will drop
+  privileges, after binding to ``server.whois.port``.
+  This allows IRRd to be started as root, bind to port 43, and then
+  drop privileges. Both must be defined, or neither.
+  Note that binding to ``server.http.port`` happens after dropping privileges,
+  as the recommended deployment is to have
+  :ref:`an HTTPS proxy <deployment-https>` in front. Therefore, there is no
+  need for IRRd to bind to port 80 or 443.
+  |br| **Default**: not defined, IRRd does not drop privileges.
+  |br| **Change takes effect**: after full IRRd restart.
 
 
 Servers
 ~~~~~~~
 * ``server.[whois|http].interface``: the network interface on which the whois or
-  HTTP interface will listen
-  |br| **Default**: ``::0``.
+  HTTP interface will listen. Running the HTTP interface behind nginx or a
+  similar service :ref:`is strongly recommended <deployment-https>`.
+  |br| **Default**: ``::0`` for whois, ``127.0.0.1`` for HTTP.
   |br| **Change takes effect**: after full IRRd restart.
 * ``server.[whois|http].port``: the port on which the whois or HTTP interface
   will listen.
-  |br| **Default**: ``43`` for whois, ``80`` for HTTP.
+  |br| **Default**: ``43`` for whois, ``8000`` for HTTP.
   |br| **Change takes effect**: after full IRRd restart.
-* ``server.[whois|http].access_list``: a reference to an access list in the
+* ``server.whois.access_list``: a reference to an access list in the
   configuration, where only IPs in the access list are permitted access. If not
-  defined, all access is permitted for whois, but all access is denied for HTTP.
-  |br| **Default**: not defined, all access permitted for whois, all access
-  denied for HTTP.
+  defined, all access is permitted.
+  |br| **Default**: not defined, all access permitted for whois
+  |br| **Change takes effect**: after SIGHUP.
+* ``server.http.status_access_list``: a reference to an access list in the
+  configuration, where only IPs in the access list are permitted access to the
+  :doc:`HTTP status page </admins/status_page>`. If not defined, all access is denied.
+  |br| **Default**: not defined, all access denied for HTTP status page
   |br| **Change takes effect**: after SIGHUP.
 * ``server.whois.max_connections``: the maximum number of simultaneous whois
   connections permitted. Note that each permitted connection will result in
   one IRRd whois worker to be started, each of which use about 200 MB memory.
   For example, if you set this to 50, you need about 10 GB of memory just for
-  IRRd's whois server
+  IRRd's whois server.
   (and additional memory for other components and PostgreSQL).
   |br| **Default**: ``10``.
+  |br| **Change takes effect**: after full IRRd restart.
+* ``server.http.workers``: the number of HTTP workers launched on startup.
+  Each worker can process one GraphQL query or other HTTP request at a time.
+  Note that each worker uses about 200 MB memory.
+  For example, if you set this to 50, you need about 10 GB of memory just for
+  IRRd's HTTP server.
+  (and additional memory for other components and PostgreSQL).
+  |br| **Default**: ``4``.
+  |br| **Change takes effect**: after full IRRd restart.
+* ``server.http.forwarded_allowed_ips``: a single IP or list of IPs from
+  which IRRd will trust the ``X-Forwarded-For`` header. This header is used
+  for IRRd to know the real client address, rather than the address of a
+  proxy.
+  |br| **Default**: ``127.0.0.1``.
   |br| **Change takes effect**: after full IRRd restart.
 
 
@@ -216,7 +257,7 @@ Email
   this email address instead. Useful for testing setups.
   |br| **Default**: not defined, no override
   |br| **Change takes effect**: after SIGHUP, for all subsequent emails.
-* ``email.notification_headers``: the header to use when sending notifications
+* ``email.notification_header``: the header to use when sending notifications
   of (attempted) changes to addresses in `notify`, `mnt-nfy` or `upd-to`
   attributes. The string ``{sources_str}`` will be replaced with the name
   of the source(s) (e.g. ``NTTCOM``) of the relevant objects. When adding
@@ -228,9 +269,10 @@ Email
   |br| `or object authorisation failures.`
   |br|
   |br| `You may receive this message because you are listed in`
-  |br| `the notify attribute on the changed object(s), or because`
+  |br| `the notify attribute on the changed object(s), because`
   |br| `you are listed in the mnt-nfy or upd-to attribute on a maintainer`
-  |br| `of the object(s).`
+  |br| `of the object(s), or the upd-to attribute on the maintainer of a`
+  |br| `parent of newly created object(s).`
 
 
 Authentication
@@ -239,7 +281,12 @@ Authentication
   which can be used to override any
   authorisation requirements for authoritative databases.
   |br| **Default**: not defined, no override password will be accepted.
-  |br| **Change takes effect**: after SIGHUP.
+  |br| **Change takes effect**: upon the next update attempt.
+* ``auth.authenticate_related_mntners``: whether to check for
+  :ref:`related object maintainers <auth-related-mntners>` when processing
+  updates.
+  |br| **Default**: true, check enabled
+  |br| **Change takes effect**: upon the next update attempt.
 * ``auth.gnupg_keyring``: the full path to the gnupg keyring.
   |br| **Default**: not defined, but required.
   |br| **Change takes effect**: after full IRRd restart.
@@ -297,7 +344,8 @@ RPKI
 * ``notify_invalid_enabled``: whether to send notifications to contacts
   of route(6) objects newly marked RPKI invalid in authoritative sources.
   Set to ``true`` or ``false``. This setting is required if ``rpki.roa_source``
-  is set. It is recommended to carefully read the
+  is set and one or more authoritative sources are configured.
+  It is recommended to carefully read the
   :ref:`RPKI notification documentation <rpki-notifications>`, as this may
   sent out notifications to many users.
   **DANGER: care is required with this setting in testing setups**
@@ -346,6 +394,24 @@ RPKI
   |br| `You may also delete these objects if they are no longer`
   |br| `relevant.`
   |br| **Change takes effect**: after the next ROA import.
+
+
+Scope filter
+~~~~~~~~~~~~
+* ``scopefilter.prefixes``: a list of IPv4 or IPv6 prefixes which are
+  considered out of scope. For details, see the
+  :doc:`scope filter documentation </admins/scopefilter>`.
+  |br| **Default**: none, prefix scope filter validation not enabled.
+  |br| **Change takes effect**: after SIGHUP. Updating the status of
+  existing objects may take 10-15 minutes.
+* ``scopefilter.asns``: a list of ASNs which are considered out of
+  scope. Ranges are also permitted, e.g. ``64496-64511``.
+  For details, see the
+  :doc:`scope filter documentation </admins/scopefilter>`.
+  May contain plain AS number, or a range, e.g. ``64496-64511``.
+  |br| **Default**: none, ASN scope filter validation not enabled.
+  |br| **Change takes effect**: after SIGHUP. Updating the status of
+  existing objects may take 10-15 minutes.
 
 
 Sources
@@ -429,6 +495,8 @@ Sources
 * ``sources.{name}.nrtm_access_list``: a reference to an access list in the
   configuration, where only IPs in the access list are permitted access to the
   NRTM stream for this particular source (``-g`` queries).
+  This same list is used to restrict access to
+  :ref:`GraphQL journal queries <graphql-journal>`.
   |br| **Default**: not defined, all access denied.
   |br| **Change takes effect**: after SIGHUP, upon next request.
 * ``sources.{name}.strict_import_keycert_objects``: a setting used when
@@ -441,6 +509,11 @@ Sources
   RPKI status.
   |br| **Default**: false, RPKI validation enabled.
   |br| **Change takes effect**: after SIGHUP, upon next full ROA import.
+* ``sources.{name}.scopefilter_excluded``: disable scope filter validation for
+  this source. If set to ``true``, all objects will be considered in scope
+  for their scope filter status.
+  |br| **Default**: false, scope filter validation enabled.
+  |br| **Change takes effect**: after SIGHUP, within a few minutes
 
 
 For more detail on mirroring other sources, and providing mirroring services
@@ -483,12 +556,16 @@ Logging
   e.g. by a log rotation process, IRRd will create a new file in the same
   location, and continue writing to the new file. Timestamps in logs are always
   in UTC, regardless of local machine timezone.
-  |br| **Default**: not defined, logs will be sent to the console.
+  |br| **Default**: not defined.
   |br| **Change takes effect**: after full IRRd restart.
 * ``log.level``: the loglevel, one of `DEBUG`, `INFO`, `WARNING`, `ERROR`,
   `CRITICAL`. The recommended level is `INFO`.
   |br| **Default**: ``INFO``.
   |br| **Change takes effect**: after SIGHUP.
+
+IRRd requires ``logfile_path`` or ``logging_config_path`` to be set if
+IRRd is started into the background. If IRRd is started with ``--foreground``,
+these options may be left undefined and all logs will be printed to stdout.
 
 If you need more granularity than these settings, you can set
 ``log.logging_config_path``. This allows you to set custom Python logging
@@ -612,14 +689,27 @@ Also see the `Python documentation for logging`_ or
 `this example from the logging cookbook`_.
 
 Changes to ``log.logging_config_path`` take effect after a full IRRd restart.
-Errors in the logging config may prevent IRRd from starting. Any errors will
-be printed to the console.
+Errors in the logging config may prevent IRRd from starting. Any such errors
+will be printed to the console.
 
 .. _Python documentation for logging: https://docs.python.org/3/library/logging.config.html#logging-config-dictschema
 .. _this example from the logging cookbook: https://docs.python.org/3/howto/logging-cookbook.html#an-example-dictionary-based-configuration
 
 Compatibility
 ~~~~~~~~~~~~~
+* ``compatibility.inetnum_search_disabled``: enabling this setting is
+  recommended when the IRRd instance never processes `inetnum` objects.
+  It enables :ref:`high performance prefix queries <performance_prefix_queries>`
+  for all queries. However, if this is enabled and your IRRd instance does
+  store `inetnum` objects, they may be missing from responses to queries.
+  Therefore, only enable this when you do not process any `inetnum` objects.
+  |br| **Default**: ``false``, i.e. `inetnum` search is enabled
+  |br| **Change takes effect**: after SIGHUP, for all subsequent queries.
+* ``compatibility.irrd42_migration_in_progress``: this setting is used
+  when doing a minimum downtime upgrade from IRRd 4.1.x to IRRd 4.2.x.
+  See the :doc:`4.2.0 release notes </releases/4.2.0>` for details.
+  |br| **Default**: ``false``, operating normally
+  |br| **Change takes effect**: after SIGHUP, for all subsequent queries.
 * ``compatibility.ipv4_only_route_set_members``: if set to ``true``, ``!i``
   queries will not return IPv6 prefixes. This option can be used for limited
   compatibility with IRRd version 2. Enabling this setting may have a

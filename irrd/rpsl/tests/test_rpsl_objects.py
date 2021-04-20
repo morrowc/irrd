@@ -3,6 +3,7 @@ import datetime
 import pytest
 from IPy import IP
 from pytest import raises
+from pytz import timezone
 
 from irrd.conf import PASSWORD_HASH_DUMMY_VALUE
 from irrd.utils.rpsl_samples import (object_sample_mapping, SAMPLE_MALFORMED_EMPTY_LINE,
@@ -50,7 +51,7 @@ class TestRPSLParsingGeneric:
     def test_missing_mandatory_attribute(self):
         obj = rpsl_object_from_text(SAMPLE_MISSING_MANDATORY_ATTRIBUTE, strict_validation=True)
         assert len(obj.messages.errors()) == 1, f'Unexpected extra errors: {obj.messages.errors()}'
-        assert 'Mandatory attribute "changed" on object route is missing' in obj.messages.errors()[0]
+        assert 'Mandatory attribute "mnt-by" on object route is missing' in obj.messages.errors()[0]
 
         obj = rpsl_object_from_text(SAMPLE_MISSING_MANDATORY_ATTRIBUTE, strict_validation=False)
         assert len(obj.messages.errors()) == 0, f'Unexpected extra errors: {obj.messages.errors()}'
@@ -137,8 +138,9 @@ class TestRPSLAsSet:
         rpsl_text = object_sample_mapping[RPSLAsSet().rpsl_object_class]
         obj = rpsl_object_from_text(rpsl_text)
         assert obj.__class__ == RPSLAsSet
+        assert obj.clean_for_create()
         assert not obj.messages.errors()
-        assert obj.pk() == 'AS-SETTEST'
+        assert obj.pk() == 'AS65537:AS-SETTEST'
         assert obj.referred_strong_objects() == [
             ('admin-c', ['role', 'person'], ['PERSON-TEST']),
             ('tech-c', ['role', 'person'], ['PERSON-TEST']),
@@ -147,9 +149,18 @@ class TestRPSLAsSet:
         assert obj.references_strong_inbound() == set()
         assert obj.source() == 'TEST'
 
-        assert obj.parsed_data['members'] == ['AS65538', 'AS65539', 'AS65537']
+        assert obj.parsed_data['members'] == ['AS65538', 'AS65539', 'AS65537', 'AS-OTHERSET']
         # Field parsing will cause our object to look slightly different than the original, hence the replace()
         assert obj.render_rpsl_text() == rpsl_text.replace('AS65538, AS65539', 'AS65538,AS65539')
+
+    def test_invalid_clean_for_create(self):
+        rpsl_text = object_sample_mapping[RPSLAsSet().rpsl_object_class]
+        rpsl_text = rpsl_text.replace('AS65537:AS-SETTEST', 'AS-SETTEST')
+        obj = rpsl_object_from_text(rpsl_text)
+        assert obj.__class__ == RPSLAsSet
+        assert not obj.messages.errors()
+        assert not obj.clean_for_create()
+        assert 'AS set names must be hierarchical and the first ' in obj.messages.errors()[0]
 
 
 class TestRPSLAutNum:
@@ -505,34 +516,20 @@ class TestRPSLRtrSet:
         assert obj.render_rpsl_text() == rpsl_text
 
 
-class TestOverwriteDateNewChangedAttributes:
-    expected_date = datetime.datetime.now().strftime('%Y%m%d')
+class TestLastModified:
+    def test_authoritative(self, config_override):
+        config_override({
+            'sources': {'TEST': {'authoritative': True}}
+        })
+        rpsl_text = object_sample_mapping[RPSLRtrSet().rpsl_object_class]
+        obj = rpsl_object_from_text(rpsl_text + 'last-modified: old-value\n')
+        last_modified = datetime.datetime(2020, 1, 1, tzinfo=timezone('UTC'))
+        expected_text = rpsl_text + 'last-modified:  2020-01-01T00:00:00Z\n'
+        assert obj.render_rpsl_text(last_modified=last_modified) == expected_text
 
-    # This applies to all objects identically - only one test needed
-    def test_changed_line_overwrite_with_date_and_comment(self):
-        new_rpsl_text = self._generate_old_new_object('changed: new1@example.com 19980101 # comment')
-        assert 'changed:        changed@example.com 20190701 # comment' in new_rpsl_text
-        assert f'changed:        new1@example.com {self.expected_date} # comment' in new_rpsl_text
-
-    def test_changed_line_overwrite_without_comment(self):
-        new_rpsl_text = self._generate_old_new_object('changed: new1@example.com 19980101')
-        assert 'changed:        changed@example.com 20190701 # comment' in new_rpsl_text
-        assert f'changed:        new1@example.com {self.expected_date}' in new_rpsl_text
-
-    def test_changed_line_overwrite_without_date_with_comment(self):
-        new_rpsl_text = self._generate_old_new_object('changed: new1@example.com#comment')
-        assert 'changed:        changed@example.com 20190701 # comment' in new_rpsl_text
-        assert f'changed:        new1@example.com {self.expected_date} # comment' in new_rpsl_text
-
-    def _generate_old_new_object(self, new_changed_line):
-        rpsl_text = object_sample_mapping[RPSLRouteSet().rpsl_object_class]
-        obj_current = rpsl_object_from_text(rpsl_text, strict_validation=True)
-
-        lines = rpsl_text.splitlines()
-        lines.insert(4, new_changed_line)
-        rpsl_text = '\n'.join(lines)
-        obj_new = rpsl_object_from_text(rpsl_text, strict_validation=True)
-
-        obj_new.overwrite_date_new_changed_attributes(obj_current)
-        assert 'Set date in changed line' in obj_new.messages.infos()[1]
-        return obj_new.render_rpsl_text()
+    def test_not_authoritative(self):
+        rpsl_text = object_sample_mapping[RPSLRtrSet().rpsl_object_class]
+        obj = rpsl_object_from_text(rpsl_text + 'last-modified: old-value\n')
+        last_modified = datetime.datetime(2020, 1, 1, tzinfo=timezone('UTC'))
+        expected_text = rpsl_text + 'last-modified:  old-value\n'
+        assert obj.render_rpsl_text(last_modified=last_modified) == expected_text

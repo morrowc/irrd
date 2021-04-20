@@ -1,5 +1,6 @@
 import logging
 import multiprocessing as mp
+import os
 import signal
 import socket
 import socketserver
@@ -7,8 +8,10 @@ import threading
 import time
 
 from IPy import IP
+from daemon.daemon import change_process_owner
 from setproctitle import setproctitle
 
+from irrd import ENV_MAIN_PROCESS_PID
 from irrd.conf import get_setting
 from irrd.server.access_check import is_client_permitted
 from irrd.server.whois.query_parser import WhoisQueryParser
@@ -20,7 +23,7 @@ mp.allow_connection_pickling()
 
 
 # Covered by integration tests
-def start_whois_server():  # pragma: no cover
+def start_whois_server(uid, gid):  # pragma: no cover
     """
     Start the whois server, listening forever.
     This function does not return, except after SIGTERM is received.
@@ -30,6 +33,8 @@ def start_whois_server():  # pragma: no cover
     logger.info(f'Starting whois server on TCP {address}')
     server = WhoisTCPServer(
         server_address=address,
+        uid=uid,
+        gid=gid,
     )
 
     # When this process receives SIGTERM, shut down the server cleanly.
@@ -59,9 +64,11 @@ class WhoisTCPServer(socketserver.TCPServer):  # pragma: no cover
     allow_reuse_address = True
     request_queue_size = 50
 
-    def __init__(self, server_address, bind_and_activate=True):  # noqa: N803
+    def __init__(self, server_address, uid, gid, bind_and_activate=True):  # noqa: N803
         self.address_family = socket.AF_INET6 if IP(server_address[0]).version() == 6 else socket.AF_INET
         super().__init__(server_address, None, bind_and_activate)
+        if uid and gid:
+            change_process_owner(uid=uid, gid=gid)
 
         self.connection_queue = mp.Queue()
         self.workers = []
@@ -107,7 +114,7 @@ class WhoisWorker(mp.Process, socketserver.StreamRequestHandler):
         """
         Whois worker run loop.
         This method does not return, except if it failed to initialise a preloader,
-        or if keep_running is set, after the first request is handled. The latter
+        or if keep_running is False, after the first request is handled. The latter
         is used in the tests.
         """
         # Disable the special sigterm_handler defined in start_whois_server()
@@ -116,10 +123,16 @@ class WhoisWorker(mp.Process, socketserver.StreamRequestHandler):
 
         try:
             self.preloader = Preloader()
-            self.database_handler = DatabaseHandler()
+            self.database_handler = DatabaseHandler(readonly=True)
         except Exception as e:
-            logger.error(f'Whois worker failed to initialise preloader or database,'
-                         f'unable to start, traceback follows: {e}', exc_info=e)
+            logger.critical(f'Whois worker failed to initialise preloader or database, '
+                            f'unable to start, terminating IRRd, traceback follows: {e}',
+                            exc_info=e)
+            main_pid = os.getenv(ENV_MAIN_PROCESS_PID)
+            if main_pid:  # pragma: no cover
+                os.kill(int(main_pid), signal.SIGTERM)
+            else:
+                logger.error('Failed to terminate IRRd, unable to find main process PID')
             return
 
         while True:

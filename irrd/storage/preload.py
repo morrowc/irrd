@@ -11,6 +11,7 @@ from setproctitle import setproctitle
 
 from irrd.conf import get_setting
 from irrd.rpki.status import RPKIStatus
+from irrd.scopefilter.status import ScopeFilterStatus
 from irrd.utils.process_support import ExceptionLoggingProcess
 from .queries import RPSLDatabaseQuery
 
@@ -240,7 +241,7 @@ class PreloadStoreManager(ExceptionLoggingProcess):
         if len(self._threads) > 1:
             # Another thread is already scheduled to follow the current one
             return
-        thread = PreloadUpdater(self, self._reload_lock)
+        thread = PreloadUpdater(self, self._reload_lock, daemon=True)
         thread.start()
         self._threads.append(thread)
 
@@ -332,12 +333,13 @@ class PreloadUpdater(threading.Thread):
 
         if not mock_database_handler:  # pragma: no cover
             from .database_handler import DatabaseHandler
-            dh = DatabaseHandler()
+            dh = DatabaseHandler(readonly=True)
         else:
             dh = mock_database_handler
 
         q = RPSLDatabaseQuery(column_names=['ip_version', 'ip_first', 'prefix_length', 'asn_first', 'source'], enable_ordering=False)
         q = q.object_classes(['route', 'route6']).rpki_status([RPKIStatus.not_found, RPKIStatus.valid])
+        q = q.scopefilter_status([ScopeFilterStatus.in_scope])
 
         for result in dh.execute_query(q):
             prefix = result['ip_first']
